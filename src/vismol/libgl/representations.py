@@ -333,8 +333,23 @@ class Representation:
         """ Function doc """
         if self.is_dynamic:
             frame, f = self.vm_glcore._safe_frame_coords(self.vm_object)
-            self.define_new_indexes_to_vbo(input_indexes = self.vm_object.dynamic_bonds[f])
-            
+            # [EN] BUG FIX (reported by the user: "IndexError: list index
+            # out of range" here while viewing a Normal Modes trajectory
+            # -- root cause was vismol_object.dynamic_bonds being built
+            # for the wrong (much smaller) frame count at representation-
+            # setup time, now fixed at the source in import_trajectory.py
+            # 's _import_normal_modes_data()). Guarding here too: dynamic_
+            # bonds is a plain Python list kept in sync with frames by
+            # whoever last called vm_session.define_dynamic_bonds(), so
+            # nothing here can guarantee it never falls behind again --
+            # falling back to the last available frame's bonds (like
+            # _safe_frame_coords already does for out-of-range frame
+            # indices) is a harmless, better failure mode than crashing
+            # the whole render loop.
+            if len(self.vm_object.dynamic_bonds) > 0:
+                f = min(f, len(self.vm_object.dynamic_bonds) - 1)
+                self.define_new_indexes_to_vbo(input_indexes = self.vm_object.dynamic_bonds[f])
+
         if ind_vbo:
             GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self.ind_vbo)
             GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, self.indexes.nbytes, self.indexes, GL.GL_DYNAMIC_DRAW)

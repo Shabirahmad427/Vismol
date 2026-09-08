@@ -2828,12 +2828,26 @@ class VismolGLCore:
     #'''
     
     def _safe_frame_coords(self, vismol_object):
-        """ Function doc 
-        This function checks if the number of the called frame will not exceed 
-        the limit of frames that each object has. Allowing two objects with 
-        different trajectory sizes to be manipulated at the same time within the 
+        """ Function doc
+        This function checks if the number of the called frame will not exceed
+        the limit of frames that each object has. Allowing two objects with
+        different trajectory sizes to be manipulated at the same time within the
         glArea
         """
+        # [EN] BUG FIX (reported by the user: visualizing a Normal Modes
+        # object crashed the render loop with "IndexError: index -1 is
+        # out of bounds for axis 0 with size 0"). A vismol object can
+        # legitimately have zero frames for a while -- e.g. Normal Modes
+        # import creates the object with vismol_object.frames =
+        # np.empty([0, natoms, 3]) BEFORE looping over the selected mode
+        # folders to append real frames -- and any render/pick pass that
+        # touches it in that window used to hit frames[-1] on an empty
+        # array. Returning the (already empty) frames array itself keeps
+        # the return type/dtype the caller expects (frame_coords.nbytes
+        # == 0, so the resulting glBufferData call is a harmless no-op)
+        # instead of raising.
+        if vismol_object.frames.shape[0] == 0:
+            return vismol_object.frames, 0
         if self.vm_session.frame < 0:
             self.vm_session.frame = 0
         if self.vm_session.frame >= vismol_object.frames.shape[0] - 1:
@@ -2843,9 +2857,12 @@ class VismolGLCore:
             frame_coords = vismol_object.frames[self.vm_session.frame]
             frame = self.vm_session.frame
         return frame_coords, frame
-    
+
     def _get_vismol_object_frame(self, vismol_object):
         """ Function doc """
+        # [EN] Same zero-frames guard as _safe_frame_coords() above.
+        if vismol_object.frames.shape[0] == 0:
+            return 0
         if self.vm_session.frame < 0:
             self.vm_session.frame = 0
         if self.vm_session.frame >= vismol_object.frames.shape[0] - 1:
