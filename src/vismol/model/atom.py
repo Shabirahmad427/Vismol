@@ -300,7 +300,15 @@ class Atom:
         return  xyz 
         """
         if frame is None:
-            frame  = self.vm_object.vm_session.frame
+            # [EN] Per-object frame pin (VismolObject.pin_frame()) --
+            # same override VismolGLCore._safe_frame_coords()/
+            # _get_vismol_object_frame() apply, kept in sync here for
+            # non-render callers (distance/dihedral calc, hover labels)
+            # that read coordinates directly through this method.
+            if self.vm_object._frame_override is not None:
+                frame = self.vm_object._frame_override
+            else:
+                frame = self.vm_object.vm_session.frame
             #print (frame, len(self.vm_object.frames))
             if len(self.vm_object.frames)-1 <= frame:
                 frame = len(self.vm_object.frames)-1

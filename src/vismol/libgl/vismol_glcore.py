@@ -2848,14 +2848,26 @@ class VismolGLCore:
         # instead of raising.
         if vismol_object.frames.shape[0] == 0:
             return vismol_object.frames, 0
-        if self.vm_session.frame < 0:
-            self.vm_session.frame = 0
-        if self.vm_session.frame >= vismol_object.frames.shape[0] - 1:
+        # [EN] Per-object frame pin (VismolObject.pin_frame()): when
+        # set, this object's own frame overrides the session-global
+        # scrubber, letting e.g. a docking receptor stay on frame 17
+        # while a ligand object elsewhere in the scene is on frame 4.
+        # An object that never calls pin_frame() falls through to the
+        # original global-frame behavior unchanged.
+        if vismol_object._frame_override is not None:
+            base_frame = vismol_object._frame_override
+            if base_frame < 0:
+                base_frame = 0
+        else:
+            if self.vm_session.frame < 0:
+                self.vm_session.frame = 0
+            base_frame = self.vm_session.frame
+        if base_frame >= vismol_object.frames.shape[0] - 1:
             frame_coords = vismol_object.frames[vismol_object.frames.shape[0] - 1]
             frame = vismol_object.frames.shape[0] - 1
         else:
-            frame_coords = vismol_object.frames[self.vm_session.frame]
-            frame = self.vm_session.frame
+            frame_coords = vismol_object.frames[base_frame]
+            frame = base_frame
         return frame_coords, frame
 
     def _get_vismol_object_frame(self, vismol_object):
@@ -2863,12 +2875,19 @@ class VismolGLCore:
         # [EN] Same zero-frames guard as _safe_frame_coords() above.
         if vismol_object.frames.shape[0] == 0:
             return 0
-        if self.vm_session.frame < 0:
-            self.vm_session.frame = 0
-        if self.vm_session.frame >= vismol_object.frames.shape[0] - 1:
+        # [EN] Same per-object frame-pin override as _safe_frame_coords().
+        if vismol_object._frame_override is not None:
+            base_frame = vismol_object._frame_override
+            if base_frame < 0:
+                base_frame = 0
+        else:
+            if self.vm_session.frame < 0:
+                self.vm_session.frame = 0
+            base_frame = self.vm_session.frame
+        if base_frame >= vismol_object.frames.shape[0] - 1:
             frame = vismol_object.frames.shape[0] - 1
         else:
-            frame = self.vm_session.frame
+            frame = base_frame
         return frame
     
     def get_viewport_pos(self, x, y):

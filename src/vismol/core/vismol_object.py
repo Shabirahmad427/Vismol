@@ -140,6 +140,23 @@ class VismolObject:
         self.chains = {}
         self.molecules = {}
 
+        # [EN] Free-form dict for callers to attach structured info to
+        # this object (e.g. docking-ensemble frame->receptor_id maps,
+        # per-pose score/rank -- see src/util/vismol_pdbqt_builder.py).
+        # Empty by default; nothing in the render/pick path reads it.
+        self.metadata = {}
+
+        # [EN] Per-object frame pin: when set (an int), every frame
+        # lookup for THIS object (see VismolGLCore._safe_frame_coords/
+        # _get_vismol_object_frame and Atom.coords()) uses this value
+        # instead of the session-global vm_session.frame, letting one
+        # object be shown at a fixed frame while every other object
+        # keeps following the global trajectory scrubber. None (the
+        # default) means "follow the global frame", so an object that
+        # never calls pin_frame() behaves exactly as before this
+        # attribute existed. Set/cleared via pin_frame()/unpin_frame().
+        self._frame_override = None
+
         self.atom_unique_id_dic = {}   # Dictionary to store atom unique identifiers (not yet defined in the code)
         self.selected_atom_ids = set() # Set to store the IDs of selected atoms (not yet defined in the code)
         
@@ -1370,6 +1387,23 @@ class VismolObject:
     def set_model_matrix(self, mat):
         """ Function doc """
         self.model_mat = np.copy(mat)
+
+    def pin_frame(self, frame_index):
+        """ Pins this object's rendering/coordinate lookups to a fixed
+            frame, overriding the session-global vm_session.frame for
+            THIS object only (see self._frame_override, set in
+            __init__, and its use in VismolGLCore._safe_frame_coords/
+            _get_vismol_object_frame and Atom.coords()). Every other
+            object in the scene keeps following the global trajectory
+            scrubber normally. Call unpin_frame() to release it.
+        """
+        self._frame_override = int(frame_index)
+
+    def unpin_frame(self):
+        """ Releases a pin set by pin_frame(), returning this object to
+            following the session-global vm_session.frame again.
+        """
+        self._frame_override = None
     
     def _generate_topology_from_index_bonds(self, bonds = None):
         """ 
