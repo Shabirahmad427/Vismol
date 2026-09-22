@@ -527,7 +527,9 @@ class VismolGTKWidget(_WidgetBase):
         click_mode.handle_bond_shortcut() for the exact requirements). """
         if getattr ( self.vm_session, "builder_atom_mode", False ):
             from gui.windows.builder.click_mode import handle_bond_shortcut
-            msg = handle_bond_shortcut ( self.vm_session )
+            msg = handle_bond_shortcut ( self.vm_session,
+                    bond_order = getattr ( self.vm_session, "builder_bond_order", 1 ),
+                    aromatic   = getattr ( self.vm_session, "builder_bond_aromatic", False ) )
             dprint ( "Builder: {}".format ( msg ) )
             self.queue_draw ( )
     

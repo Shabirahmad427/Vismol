@@ -346,8 +346,9 @@ class VismolGLCore:
             # shift always falls through to normal multi-select so 'b'
             # add-bond-between-two-selected-atoms keeps working
             # unchanged; not ctrl either -- Ctrl+click is reserved for
-            # cycling a BOND's order, see the mouse_released() hook below
-            # and click_mode.cycle_bond_order()).
+            # setting a BOND's order (to the sidebar's current
+            # selection), see the mouse_released() hook below and
+            # click_mode.apply_selected_bond_order()).
             #
             # ALSO covers the "move" tool -- a plain drag there means
             # "reposition this existing atom" instead of "create a new
@@ -477,8 +478,9 @@ class VismolGLCore:
             self.dragging = False
             self.parent_widget.queue_draw ( )
             return
-        # [EN] Builder "Ctrl+click on a bond -> cycle its order" -- see
-        # click_mode.cycle_bond_order()/click_mode.find_bond_at_pixel(). Pure Python/
+        # [EN] Builder "Ctrl+click on a bond -> set its order to the
+        # sidebar's current selection" -- see click_mode.
+        # apply_selected_bond_order()/click_mode.find_bond_at_pixel(). Pure Python/
         # numpy (a 2D-projection distance check, not a GPU pick -- see
         # click_mode.find_bond_at_pixel()'s own docstring for why), so unlike
         # builder_placing_atom/builder_checking_press below, this needs
@@ -496,12 +498,21 @@ class VismolGLCore:
             if target_object is not None:
                 bond = click_mode.find_bond_at_pixel ( self, target_object, mouse_x, mouse_y )
                 if bond is not None:
-                    click_mode.cycle_bond_order ( self, target_object, bond )
+                    click_mode.apply_selected_bond_order ( self, target_object, bond )
             # limpa qualquer candidato de atom-drag que tenha ficado
             # pendente (um Ctrl+clique sem arrasto real nunca chega a
             # consumir esse candidato em mouse_motion())
             self.vm_session.builder_ctrl_press_candidate_atom  = None
             self.vm_session.builder_ctrl_press_candidate_depth = None
+            # [EN] BUG FIX: same root cause as builder_checking_press just
+            # below in the plain-click path (see that fix's comment for the
+            # full mechanism) -- a fast Ctrl+click (press+release with no
+            # render() in between) left builder_ctrl_checking_press True,
+            # so the NEXT render() call would re-pick whatever's at this
+            # click's position and hand it to mouse_motion() as a phantom
+            # Ctrl-drag candidate, even though this click already fully
+            # resolved as a bond-order-cycle with no drag involved.
+            self.builder_ctrl_checking_press = False
             self.dragging = False
             self.parent_widget.queue_draw ( )
             return
@@ -513,6 +524,31 @@ class VismolGLCore:
         # case, handled below via the normal builder_placing_atom path.
         self.vm_session.builder_press_candidate_atom  = None
         self.vm_session.builder_press_candidate_depth = None
+        # [EN] BUG FIX (reported by the user: placing a new atom left a
+        # "residual" bond-drag, as if a second click had immediately tried
+        # to connect two atoms). Root cause: mouse_pressed() sets
+        # self.builder_checking_press = True on EVERY plain press while the
+        # "add"/"move" tool is active, BEFORE it's known whether the press
+        # will resolve to a drag or to a plain click -- that flag is only
+        # ever CONSUMED (turned into builder_press_candidate_atom) inside
+        # render(), never cleared here. For a fast click (press+release
+        # with no render() in between), it was still True when this method
+        # returned early via builder_placing_atom below -- so on the VERY
+        # NEXT render() call (the one builder_placing_atom itself needs to
+        # actually place the atom), builder_checking_press ALSO fired,
+        # re-picking whatever is now at the click's pixel position -- which
+        # is the atom that render() had JUST placed one line earlier (see
+        # the order of those two checks in render()). That atom became a
+        # dangling "candidate", and the very next mouse_motion() (no button
+        # even held anymore) grabbed it and called start_bond_drag() on it,
+        # exactly matching the reported symptom. Clearing the flag here,
+        # alongside the candidate it would have produced, closes the race:
+        # by the time a genuine drag is actually in progress, render() has
+        # already had a chance to run at least once and already reset this
+        # to False itself, so this is a no-op for that path (see
+        # builder_bond_drag_active/builder_ctrl_drag_active's early returns
+        # above, both already resolved before ever reaching this line).
+        self.builder_checking_press = False
         if self.dragging:
             if left:
                 if self.shift:
@@ -563,8 +599,16 @@ class VismolGLCore:
                 # WHICH atom was clicked) before builder_tool=='delete'
                 # is acted on -- see the new check added next to
                 # "if self.picking: self._pick()" in render().
+                # [EN] "Add Structure" tool (vm_session.builder_tool ==
+                # "add_structure") shares this EXACT same deferred-pick
+                # mechanism -- placing a whole structure also needs a real
+                # depth-buffer read, same GL-context constraint as placing
+                # a single atom (see the comment block above). Which of the
+                # two actually runs is decided in render(), by re-reading
+                # builder_tool at that point -- see the hook next to
+                # "if self.picking: self._pick()".
                 if ( getattr ( self.vm_session, "builder_atom_mode", False )
-                     and getattr ( self.vm_session, "builder_tool", "add" ) == "add"
+                     and getattr ( self.vm_session, "builder_tool", "add" ) in ( "add", "add_structure" )
                      and not self.shift ):
                     self.builder_click_x = np.float32(mouse_x)
                     self.builder_click_y = np.float32(mouse_y)
@@ -1294,7 +1338,16 @@ class VismolGLCore:
         # which reads the depth buffer via a real draw pass) only runs
         # here, where GTK guarantees the context is current.
         if getattr ( self, "builder_placing_atom", False ):
-            click_mode.handle_click_to_place_atom ( self, self.builder_click_x, self.builder_click_y )
+            # [EN] "Add Structure" tool re-uses this exact deferred flag
+            # (see the mouse_released() hook that sets it) -- branch on
+            # builder_tool here, the one place both paths actually run the
+            # real GL depth-buffer read.
+            if getattr ( self.vm_session, "builder_tool", "add" ) == "add_structure":
+                msg = click_mode.handle_click_to_add_structure ( self, self.builder_click_x, self.builder_click_y )
+                if msg is not None:
+                    dprint ( "DEBUG click_mode: {}".format ( msg ) )
+            else:
+                click_mode.handle_click_to_place_atom ( self, self.builder_click_x, self.builder_click_y )
             self.builder_placing_atom = False
         # [EN] Builder "click-and-drag to create a bonded atom" -- see
         # the note added to mouse_pressed() for why this has to be
@@ -1365,7 +1418,47 @@ class VismolGLCore:
              and getattr ( self.vm_session, "builder_tool", "add" ) == "delete"
              and self.atom_picked is not None ):
             click_mode.handle_click_to_delete_atom ( self )
-        
+
+        # [EN] Builder "Bond Order" tool -- same "let the click fall
+        # through to normal picking first" reasoning as "delete" just
+        # above (click_mode.handle_click_to_set_bond_order() needs to
+        # know WHICH atom was clicked). See that function's own docstring
+        # for the full two-click "arm first atom, click a second to
+        # apply" interaction -- added after the user found both Ctrl+
+        # click-on-the-bond-line and the pk1/pk2 button too fiddly for
+        # changing an EXISTING bond's order.
+        if ( getattr ( self.vm_session, "builder_atom_mode", False )
+             and getattr ( self.vm_session, "builder_tool", "add" ) == "bond_order"
+             and self.atom_picked is not None ):
+            msg = click_mode.handle_click_to_set_bond_order ( self )
+            if msg is not None:
+                dprint ( "DEBUG click_mode: {}".format ( msg ) )
+
+        # [EN] Builder "Attach Fragment" tool -- same "let the click fall
+        # through to normal picking first" wiring as "delete"/"Bond
+        # Order" above. See click_mode.handle_click_to_attach_fragment()
+        # for the full behaviour (click a hydrogen atom to replace it
+        # with whatever fragment is currently selected in the Fragment
+        # Library window).
+        if ( getattr ( self.vm_session, "builder_atom_mode", False )
+             and getattr ( self.vm_session, "builder_tool", "add" ) == "attach_fragment"
+             and self.atom_picked is not None ):
+            msg = click_mode.handle_click_to_attach_fragment ( self )
+            if msg is not None:
+                dprint ( "DEBUG click_mode: {}".format ( msg ) )
+
+        # [EN] Builder "Rotate Dihedral" tool -- same "let the click fall
+        # through to normal picking first" wiring as "delete"/"Bond
+        # Order"/"Attach Fragment" above. See click_mode.handle_click_to_
+        # pick_dihedral_atom() for the full behaviour (click 4 atoms in
+        # sequence, pk1->pk4, to arm the sidebar's rotation slider).
+        if ( getattr ( self.vm_session, "builder_atom_mode", False )
+             and getattr ( self.vm_session, "builder_tool", "add" ) == "rotate_dihedral"
+             and self.atom_picked is not None ):
+            msg = click_mode.handle_click_to_pick_dihedral_atom ( self )
+            if msg is not None:
+                dprint ( "DEBUG click_mode: {}".format ( msg ) )
+
         #print('self.dragging', self.dragging)
         
         GL.glClearColor(self.bckgrnd_color[0], self.bckgrnd_color[1],
@@ -1469,6 +1562,126 @@ class VismolGLCore:
         if hovered_atom is not None:
             world_center, hover_up, hover_radius = click_mode.draw_hover_highlight(self, hovered_atom)
             click_mode.draw_hover_info_text(self, hovered_atom, world_center, hover_up, hover_radius)
+
+        # [EN] Builder "drag-to-bond -- live preview" (roadmap section 4,
+        # plus the "light up which EXISTING atom this will bond to" the
+        # user asked for right after seeing section 4's ring in action):
+        # reuses the SAME hover-ring drawing code above (click_mode.
+        # draw_hover_highlight(), already proven live/working here),
+        # colour-coded by the bond's CURRENT effective order/aromaticity
+        # (click_mode.update_bond_drag() keeps builder_bond_drag_preview_
+        # order/_preview_aromatic in sync every motion event -- ALWAYS,
+        # whether that order comes from the live drag distance or from an
+        # explicit sidebar pick, see that function's own comment for why
+        # both cases need a colour here, not just the distance-decided
+        # one).
+        #
+        # WHICH atom gets the ring: builder_bond_drag_snap_target (also
+        # kept in sync by update_bond_drag(), via the SAME _current_snap_
+        # target() finish_bond_drag() itself uses, so this never lights
+        # up an atom that release would then not actually snap onto) --
+        # the EXISTING atom the drag is currently close enough to connect
+        # to, if any; otherwise the ring stays on the dragged (temporary)
+        # atom itself, exactly as before this atom-highlighting addition.
+        #
+        # Deliberately does NOT reuse draw_hover_info_text() (that one is
+        # dead code -- returns False immediately, see its own docstring)
+        # for the NUMERIC LABEL drawn on the ring below -- draw_ring_label()
+        # is a new, small, CORRECT replacement (see its own docstring for
+        # exactly why draw_hover_info_text()'s old approach can't just be
+        # revived as-is).
+        drag_preview_order = getattr(self.vm_session, "builder_bond_drag_preview_order", None)
+        if drag_preview_order is not None:
+            snap_target  = getattr(self.vm_session, "builder_bond_drag_snap_target", None)
+            dragged_atom = getattr(self.vm_session, "builder_bond_drag_new_atom", None)
+            highlight_atom = snap_target if snap_target is not None else dragged_atom
+            if highlight_atom is not None:
+                preview_color = click_mode.bond_order_preview_color(
+                        drag_preview_order, getattr(self.vm_session, "builder_bond_drag_preview_aromatic", False))
+                world_center, _hl_up, _hl_radius = click_mode.draw_hover_highlight(self, highlight_atom, color=preview_color, alpha=0.35)
+                # [EN] Numeric label (user's own request, after seeing the
+                # coloured ring: "quero colocar label nos circulos... '1',
+                # '2', '3'") -- drawn dead-centred on the SAME ring, in
+                # plain white so it stays readable against any of the 3
+                # order colours (and the distinct aromatic purple) alike.
+                click_mode.draw_ring_label(self, world_center, str(drag_preview_order))
+
+        # [EN] Builder "Bond Order" tool -- persistent highlight on the
+        # FIRST atom armed by click_mode.handle_click_to_set_bond_order()
+        # (see its own docstring), waiting for a second click to complete
+        # the pair. Same ring+label mechanism as the drag preview just
+        # above, coloured/labelled by the sidebar's CURRENT selection
+        # (there's no distance involved here to override it -- this tool
+        # always uses exactly what the sidebar says, unlike drag-to-bond).
+        armed_atom = getattr(self.vm_session, "builder_bond_pick_first_atom", None)
+        if armed_atom is not None:
+            armed_order    = getattr(self.vm_session, "builder_bond_order", 1)
+            armed_aromatic = getattr(self.vm_session, "builder_bond_aromatic", False)
+            armed_color = click_mode.bond_order_preview_color(armed_order, armed_aromatic)
+            world_center, _hl_up, _hl_radius = click_mode.draw_hover_highlight(self, armed_atom, color=armed_color, alpha=0.35)
+            click_mode.draw_ring_label(self, world_center, str(armed_order))
+
+        # [EN] Builder "Rotate Dihedral" tool -- highlights each of the up
+        # to 4 atoms picked so far (click_mode.handle_click_to_pick_
+        # dihedral_atom()), numbered "1".."4" in click order so it's
+        # visually obvious which atom is which once the dihedral is armed
+        # (atoms #2/#3 are the rotation axis, #1/#4 are only there to
+        # define/measure the angle). Same ring+label mechanism as the
+        # other tools above; a single neutral color (not order-coded --
+        # there's no bond order concept here) keeps it visually distinct
+        # from the Bond Order tool's own rings.
+        dihedral_pick_atoms = getattr(self.vm_session, "builder_dihedral_pick_atoms", None)
+        if dihedral_pick_atoms:
+            for pick_index, picked_atom in enumerate(dihedral_pick_atoms):
+                world_center, _hl_up, _hl_radius = click_mode.draw_hover_highlight(
+                        self, picked_atom, color=(0.2, 0.6, 1.0), alpha=0.35)
+                click_mode.draw_ring_label(self, world_center, str(pick_index + 1))
+
+        # [EN] Builder "Atom Types" window -- user's own follow-up
+        # request ("colocar o label dos indexes no vobject, [para]
+        # serem facilmente identificados"): while that window is open,
+        # numbers each atom it's currently listing with its own atom_id
+        # (matching column 0 of that window's own treeview exactly), so
+        # a row there and the atom it refers to on screen are trivially
+        # easy to match up. Text-ONLY (no highlight ring, unlike the
+        # tools above -- user's own follow-up request, see the comment
+        # right at the draw call below for why);
+        # vm_session.builder_atom_types_labeled_atoms is set/cleared by
+        # atom_types_window.py itself (populated on open/refresh, wiped
+        # on close -- also wiped by builder_sidebar.py's own
+        # close_window() when the WHOLE Builder session ends).
+        #
+        # Guards against a STALE reference (an atom deleted by some
+        # OTHER Builder action since this window's own last refresh, not
+        # yet caught up) the same way the Bond Order tool's own armed-
+        # atom guard already does -- drawing a highlight for an atom_id
+        # that no longer exists in its object would crash the same way
+        # a stale representation's own indexes already did before that
+        # was fixed (project_edit_builder_stale_representation_crash).
+        #
+        # BUG FIX (caught by this session's own test, not a live report):
+        # checking ONLY "does this atom_id still exist" is NOT enough --
+        # remove_atom() RENUMBERS every surviving atom above the removed
+        # one DOWN by one, mutating .atom_id IN PLACE on the SAME Atom
+        # objects (see remove_atom()'s own docstring); the just-deleted
+        # atom's OWN .atom_id is never touched, so it can end up
+        # numerically EQUAL to whatever atom_id a surviving atom just got
+        # renumbered into. Comparing by IDENTITY (is this atom_id slot
+        # still pointing back at THIS SAME object) is what actually
+        # detects staleness correctly.
+        #
+        # [EN] BUG FIX/DESIGN CHANGE (user's own explicit follow-up --
+        # "nao precisamos das esferas amarelas de realce ... vamos
+        # deixar apenas os labels"): no longer calls draw_hover_
+        # highlight() here at all -- just the number, positioned via the
+        # new, highlight-free click_mode.atom_world_position() instead.
+        labeled_atoms = getattr(self.vm_session, "builder_atom_types_labeled_atoms", None)
+        if labeled_atoms:
+            for labeled_atom in labeled_atoms:
+                if labeled_atom.vm_object.atoms.get(labeled_atom.atom_id) is not labeled_atom:
+                    continue
+                world_center = click_mode.atom_world_position(labeled_atom)
+                click_mode.draw_ring_label(self, world_center, str(labeled_atom.atom_id))
 
         # Fecha o cronometro do frame e reporta periodicamente. Medimos so o
         # tempo de CPU/submissao (sem glFinish, que serializaria a GPU e
