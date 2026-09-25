@@ -469,15 +469,24 @@ class VismolObject:
                                                                   labels        = None     , 
                                                                   color         = [1, 1, 0, 1])
         elif rep_type == "surface":
-            # Create a LabelRepresentation object and add it to the 'representations' dictionary
+            # [EN] User request: a general (VDW/SAS/SES) whole-molecule
+            # surface, see vismol.utils... wait, util/molecular_surface.py
+            # (util/molecular_surface.build_surface_mesh()) -- this branch
+            # already existed (unused by the QC surface tool, which always
+            # uses its own "surface1"/"surface2" keys instead) but never
+            # passed `surface_name`, leaving self.surf_name at its own
+            # None default; explicit now so draw_representation()'s own
+            # `surface_trajectory[frame][self.surf_name]` lookup has a
+            # readable key ('surface') instead of an implicit None one.
             self.representations["surface"] = SurfaceRepresentation(vismol_object = self                      ,
-                                                                    vismol_glcore = self.vm_session.vm_glcore ,  
+                                                                    vismol_glcore = self.vm_session.vm_glcore ,
                                                                     name          = 'surface'                 ,
                                                                     active        = True                      ,
                                                                     indexes       = []                        ,
-                                                                    is_dynamic    = False)  
-            
-            
+                                                                    is_dynamic    = False                     ,
+                                                                    surface_name  = 'surface'                 )
+
+
             #self.representations["surface"] = SurfaceRepresentation(vismol_object = self  ,
             #                                                        vismol_glcore = self.vm_session.vm_glcore)
                                                                     #rep_type      = "mol", 
@@ -493,10 +502,15 @@ class VismolObject:
         
         
         elif rep_type == 'cartoon':
-            self.representations["cartoon"] =CartoonRepresentation(name = 'cartoon', active = True, 
-                                                                   rep_type = 'mol', vismol_object = self, 
-                                                                   vismol_glcore = self.vm_session.vm_glcore, 
-                                                                   indexes = [])
+            # [EN] Independent Cartoon representation -- see
+            # CartoonRepresentation's own docstring (representations.py)
+            # and vismol.utils.ribbon_backbone/ribbon_geometry for the
+            # actual spline/secondary-structure/mesh work. Constructor no
+            # longer takes rep_type='mol'/indexes=[] -- neither was ever
+            # used by the mesh-building path, only by the old atom-frames-
+            # based Representation.__init__() this class still doesn't call.
+            self.representations["cartoon"] = CartoonRepresentation (
+                    vismol_object = self, vismol_glcore = self.vm_session.vm_glcore )
         
         # elif rep_type == "dotted_lines":
         #     self.representations["dotted_lines"] = LinesRepresentation(self, self.vm_session.vm_glcore,

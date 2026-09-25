@@ -32,7 +32,7 @@ class Atom:
     def __init__(self, vismol_object, name="Xx", index=None, residue=None,
                  chain=None, pos=None, symbol=None, atom_id=None, color=None,
                  vdw_rad=None, cov_rad=None, ball_rad=None, electronegativity=None,
-                 occupancy=0.0, bfactor=0.0, charge=0.0, bonds_indexes=None):
+                 occupancy=0.0, bfactor=0.0, charge=0.0, formal_charge=0, bonds_indexes=None):
         """ Class initializer """
         self.vm_object   = vismol_object
         self.vm_session  = vismol_object.vm_session
@@ -84,6 +84,16 @@ class Atom:
         self.occupancy = occupancy
         self.bfactor = bfactor
         self.charge = charge
+        # [EN] 2026-09-25: a SEPARATE field from `charge` above -- `charge`
+        # is the MM/QC PARTIAL charge (a float, populated from `system.
+        # mmState.charges` once a force field is assigned; see
+        # pDynamo2EasyHybrid/session.py's define_a_new_QCModel()).
+        # `formal_charge` is the INTEGER formal/protonation charge (0 by
+        # default) the Builder's own atom_ops.protonate_atom()/
+        # deprotonate_atom() read and write -- kept distinct so assigning
+        # an MM force field never silently overwrites a user-set
+        # protonation state, and vice versa.
+        self.formal_charge = formal_charge
         if bonds_indexes is None:
             self.bonds_indexes = []
         else:

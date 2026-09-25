@@ -336,7 +336,7 @@ class VismolSession(Config):
     
     def _selection_function_set(self, selected, _type=None, disable=True):
         """ Function doc """
-        #print('selected', selected) 
+        #print('selected', selected)
         if self.picking_selection_mode: # True for picking mode
             if selected:
                 assert len(selected) == 1
@@ -345,6 +345,24 @@ class VismolSession(Config):
             else:
                 self.picking_selections.selection_function_picking(None)
         else: # False for viewing mode
+            # [EN] 2026-09-25, user's own explicit request: "enquanto o
+            # modo 'editing' estiver 'on', nao mostrar nenhuma selecao.
+            # Quando o builder estiver aberto e o modo editing estiver
+            # desligado, selecoes sao permitidas." -- builder_atom_mode
+            # is only ever True while the Builder sidebar is open AND
+            # its own "Editing: ON/OFF" toggle is on (see builder_
+            # sidebar.py's open_window()/close_window()/on_placemode_
+            # toggled()) -- False both while the Builder is closed and
+            # while it's open but paused, so a single check here already
+            # covers exactly the 2 cases the request describes. No-ops
+            # instead of calling selection_function_viewing_set() at all,
+            # so shift+click/shift+drag genuinely can't CHANGE the
+            # viewing selection while actively editing -- not just a
+            # rendering suppression (see vm_glcore.py's render(), which
+            # ALSO hides whatever selection already existed from before
+            # Editing was turned back on).
+            if getattr(self, "builder_atom_mode", False):
+                return
             self.selections[self.current_selection].selection_function_viewing_set(selected, _type, disable)
     
     def viewing_selection_mode(self, sel_type="atom"):

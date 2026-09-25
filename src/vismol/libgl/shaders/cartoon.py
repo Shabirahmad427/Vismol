@@ -1,6 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
+#  Independent Cartoon representation -- shader pair.
+#
+#  [EN] Freshly written for the new ribbon renderer (see ribbon_geometry.py/
+#  ribbon_backbone.py in vismol/utils/ and CartoonRepresentation in
+#  libgl/representations.py) -- replaces the shader that shipped with the
+#  cartoon implementation being removed. `CameraMatrices` (the UBO block:
+#  view_mat/proj_mat), the `model_mat` uniform, and the `Light my_light`
+#  uniform struct (position/intensity/ambient_coef/shininess) are NOT a
+#  cartoon-specific convention to reinvent -- they're this whole engine's
+#  own fixed per-frame binding contract (VismolGLCore.update_camera_ubo()/
+#  load_lights(), shared by every representation type's shader), so this
+#  new shader still declares them exactly as every other shader in this
+#  package does; independence from the old cartoon code is about the
+#  RIBBON algorithm and this file's own structure, not about redeclaring
+#  the graphics engine's shared interface under different names.
+# ============================================================================
 
 v_shader_triangles = """
 #version 330
@@ -19,22 +35,27 @@ out vec3 frag_color;
 out vec3 frag_coord;
 out vec3 frag_norm;
 
-void main(){
+void main () {
     frag_color = vert_color;
-    //frag_norm = vert_norm;
+    // [EN] Matches every other shader in this package's own convention
+    // (see e.g. shaders/sticks.py): normals are transformed by model_mat
+    // alone, not the full model-view matrix -- my_light.position (below)
+    // is likewise a fixed, un-transformed direction (VismolGLCore.
+    // load_lights() uploads self.light_position as-is, no per-frame view
+    // transform), so keeping normals in that SAME space is what makes
+    // the dot-product lighting math correct here, not an inconsistency.
     frag_norm = mat3(transpose(inverse(model_mat))) * vert_norm;
     frag_coord = (view_mat * model_mat * vec4(vert_coord, 1.0)).xyz;
     gl_Position = proj_mat * view_mat * model_mat * vec4(vert_coord, 1.0);
 }
 """
+
 f_shader_triangles = """
 #version 330
 
 struct Light {
     vec3 position;
-    //vec3 color;
     vec3 intensity;
-    //vec3 specular_color;
     float ambient_coef;
     float shininess;
 };
@@ -47,49 +68,40 @@ in vec3 frag_norm;
 
 out vec4 final_color;
 
-void main(){
+void main () {
     vec3 normal = normalize(frag_norm);
-    // [EN] BUG FIX (user report, with screenshot: "a luz parece errada" --
-    // blotchy dark/bright patches on the same continuous ribbon surface).
-    // draw_representation() in representations.py calls
-    // GL.glDisable(GL.GL_CULL_FACE) for this representation, so BOTH
-    // sides of a thin, twisting ribbon (helix/beta, which are only ~0.2-
-    // 0.4 A thick) are visible at once from many viewing angles. Every
-    // triangle's normal here was computed once, facing outward from
-    // whichever side make_normals() happened to wind it -- when the
-    // camera sees the OTHER (back) side of that same thin surface, the
-    // stored normal is pointing roughly AWAY from the viewer/light
-    // instead of towards them, so diffuse_coef below clamps near 0 and
-    // that patch renders dark -- while an adjacent patch still showing
-    // its front face lights up normally. Exactly the alternating light/
-    // dark blotches on the same ribbon in the screenshot. Standard,
-    // textbook fix for lighting an open/two-sided surface (see any
-    // OpenGL/GLSL reference on "two-sided lighting"): gl_FrontFacing is
-    // a GLSL built-in that's true for the winding-order-facing side of
-    // the triangle currently being rasterized -- flip the normal when
-    // looking at the back side, so the SAME physical surface point is
-    // lit consistently regardless of which side the camera currently
-    // sees.
+
+    // [EN] Two-sided lighting: a ribbon is a THIN, open surface (helix/
+    // strand cross-sections are only ~0.5 A tall) -- draw_representation()
+    // disables face culling for it, so both the "front" and "back" of the
+    // SAME physical ribbon surface are visible at once from many camera
+    // angles. Without this flip, whichever side's stored normal happens
+    // to face away from the camera/light renders dark while the
+    // neighbouring, front-facing side of that same continuous surface
+    // stays lit -- alternating light/dark blotches on one ribbon.
+    // gl_FrontFacing is true for whichever side the current triangle's
+    // winding order faces the camera; flipping the normal on the back
+    // side keeps the same physical surface point lit consistently no
+    // matter which side the camera currently sees.
     if (!gl_FrontFacing) {
         normal = -normal;
     }
+
     vec3 vert_to_light = normalize(my_light.position);
-    vec3 vert_to_cam = normalize(frag_coord);
-    
-    // Ambient Component
+    vec3 vert_to_cam   = normalize(frag_coord);
+
     vec3 ambient = my_light.ambient_coef * frag_color * my_light.intensity;
-    
-    // Diffuse component
+
     float diffuse_coef = max(0.0, dot(normal, vert_to_light));
     vec3 diffuse = diffuse_coef * frag_color * my_light.intensity;
-    
-    // Specular component
+
     float specular_coef = 0.0;
-    if (diffuse_coef > 0.0)
-        specular_coef = pow(max(0.0, dot(vert_to_cam, reflect(-vert_to_light, normal))), my_light.shininess);
+    if (diffuse_coef > 0.0) {
+        specular_coef = pow(max(0.0, dot(vert_to_cam, reflect(vert_to_light, normal))), my_light.shininess);
+    }
     vec3 specular = specular_coef * my_light.intensity;
-    specular = specular * (vec3(1) - diffuse);
-    
+    specular = specular * (vec3(1.0) - diffuse);
+
     final_color = vec4(ambient + diffuse + specular, 1.0);
 }
 """

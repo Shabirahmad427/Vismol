@@ -114,6 +114,43 @@ class VismolConfig:
                               # glArea right-click menu (Show > labels).
                               "label_content"              : "name",
                               "label_show_all"             : False,
+
+                              # [EN] Cartoon (ribbon) representation --
+                              # "Preferences > Cartoon" tab. Every value
+                              # here matches vismol.utils.ribbon_geometry.
+                              # DEFAULT_CARTOON_SETTINGS exactly (the
+                              # single source of truth for the actual
+                              # numeric defaults) so a config missing
+                              # these keys entirely (any .config.json
+                              # saved before this feature existed) and a
+                              # brand-new default config behave
+                              # identically -- see representations.py's
+                              # _cartoon_settings_from_gl_parameters().
+                              # The 2 "*_tolerance" values are a
+                              # PERCENTAGE (100 = published P-SEA
+                              # thresholds as-is), not the 0-1 scale
+                              # factor ribbon_geometry itself uses
+                              # internally -- conversion happens in
+                              # _cartoon_settings_from_gl_parameters().
+                              "cartoon_helix_width"        : 1.60,
+                              "cartoon_helix_height"       : 0.18,
+                              "cartoon_strand_width"       : 1.40,
+                              "cartoon_strand_height"      : 0.18,
+                              "cartoon_arrow_width"        : 2.20,
+                              "cartoon_coil_radius"        : 0.32,
+                              "cartoon_helix_tolerance"    : 100.0,
+                              "cartoon_strand_tolerance"   : 150.0,
+                              "cartoon_min_run"            : 2,
+                              "cartoon_dynamic_secondary_structure" : False,
+                              "surface_type"                : "ses",
+                              "surface_probe_radius"        : 1.4,
+                              "surface_grid_spacing"        : 0.8,
+                              "surface_taubin_enabled"      : False,
+                              "surface_taubin_iterations"   : 15,
+                              "surface_color_mode"          : "atom",
+                              "cartoon_color_helix"        : [0.90, 0.20, 0.55],
+                              "cartoon_color_strand"       : [0.95, 0.85, 0.15],
+                              "cartoon_color_coil"         : [0.85, 0.85, 0.85],
                               }
         self.n_proc = 2
         # self.representations_available = {"dots", "lines", "nonbonded", "dotted_lines",

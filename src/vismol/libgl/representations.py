@@ -1860,214 +1860,6 @@ class LabelRepresentation:
         pass
 
 
-class CartoonRepresentation(Representation):
-    def __init__ (self, name = 'cartoon', active = True, rep_type = 'mol', vismol_object = None, vismol_glcore = None, indexes = []):
-        self.name               = name
-        self.active             = active
-        self.type               = rep_type
-
-        self.vm_object             = vismol_object
-        self.vm_glcore             = vm_glcore
-        
-        # representation 	
-        self.vao            = None
-        self.ind_vbo        = None
-        self.coord_vbo      = None
-        self.norm_vbo       = None
-        self.col_vbo        = None
-        self.size_vbo       = None
-           
-
-        # bgrd selection   
-        self.sel_vao        = None
-        self.sel_ind_vbo    = None
-        self.sel_coord_vbo  = None
-        self.sel_col_vbo    = None
-        self.sel_size_vbo   = None
-
-
-        #     S H A D E R S
-        self.shader_program     = None
-        self.sel_shader_program = None
-        
-        
-        coords, normals, indexes, colors = cartoon.cartoon(vismol_object, spline_detail=5)
-        
-        coords = coords.flatten()
-        normals = normals.flatten()
-        colors = colors.flatten()
-        
-        
-        self.coords2 = coords
-        self.colors2 = colors
-        self.normals2 = normals
-        self.indexes2 = indexes
-
-
-    def _make_gl_vao_and_vbos (self, indexes = None):
-        """ Function doc """
-        #if indexes is not None:
-        #    pass
-        #else:
-        
-        #dot_qtty  = int(len(self.vm_object.frames[0])/3)
-        #indexes = []
-        #for i in range(dot_qtty):
-        #    indexes.append(i)
-        
-
-        self.shader_program     = self.vm_glcore.shader_programs[self.name]
-        #self.sel_shader_program = self.vm_glcore.shader_programs[self.name+'_sel']
-        
-
-        """
-        coords  = np.array(self.coords2, dtype=np.float32)
-        colors  = np.array(self.colors2, dtype=np.float32)
-        normals = np.array(self.normals2, dtype=np.float32)
-        indexes = np.array(self.indexes2, dtype=np.uint32)
-        """
-        
-        
-        coords  = self.coords2 
-        colors  = self.colors2 
-        normals = self.normals2
-        indexes = self.indexes2
-        
-        #print ('len(coords),len(colors), len(normals),len(indexes)', len(coords),len(colors), len(normals),len(indexes)  )
-
-        self._make_gl_representation_vao_and_vbos (indexes    = indexes,
-                                                   coords     = coords ,
-                                                   colors     = colors ,
-                                                   dot_sizes  = None   ,
-                                                   normals    = normals
-                                                   )
-        
-        
-        
-        self.ind_vbo = GL.glGenBuffers(1)
-        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self.ind_vbo)
-        GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, indexes.itemsize*len(indexes), indexes, GL.GL_DYNAMIC_DRAW)
-        
-        #self.coord_vbo = GL.glGenBuffers(1)
-        #GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.coord_vbo)
-        ##GL.glBufferData(GL.GL_ARRAY_BUFFER, coords.itemsize*len(coords), coords, GL.GL_STATIC_DRAW)
-        #GL.glBufferData(GL.GL_ARRAY_BUFFER, coords.nbytes, coords, GL.GL_STATIC_DRAW)
-        #gl_coord = GL.glGetAttribLocation(self.shader_program, 'vert_coord')
-        #GL.glEnableVertexAttribArray(gl_coord)
-        #GL.glVertexAttribPointer(gl_coord, 3, GL.GL_FLOAT, GL.GL_FALSE, 3*coords.itemsize, ctypes.c_void_p(0))
-        
-        
-        self.col_vbo = GL.glGenBuffers(1)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.col_vbo)
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, colors.itemsize*len(colors), colors, GL.GL_STATIC_DRAW)
-        gl_color = GL.glGetAttribLocation(self.shader_program, 'vert_color')
-        GL.glEnableVertexAttribArray(gl_color)
-        GL.glVertexAttribPointer(gl_color, 3, GL.GL_FLOAT, GL.GL_FALSE, 3*colors.itemsize, ctypes.c_void_p(0))
-
-        self.norm_vbo = GL.glGenBuffers(1)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.norm_vbo)
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, normals.itemsize*len(normals), normals, GL.GL_STATIC_DRAW)
-        gl_norm = GL.glGetAttribLocation(self.shader_program, 'vert_norm')
-        GL.glEnableVertexAttribArray(gl_norm)
-        GL.glVertexAttribPointer(gl_norm, 3, GL.GL_FLOAT, GL.GL_FALSE, 3*normals.itemsize, ctypes.c_void_p(0))
-        
-        
-        
-        
-        
-        #self.centr_vbo = GL.glGenBuffers(1)
-        #GL.glBindBuffer(GL.GL_ARRAY_BUFFER, coords)
-        #GL.glBufferData(GL.GL_ARRAY_BUFFER, coords.itemsize*len(coords), coords, GL.GL_STATIC_DRAW)
-        #gl_center = GL.glGetAttribLocation(self.shader_program , 'vert_centr')
-        #GL.glEnableVertexAttribArray(gl_center)
-        #GL.glVertexAttribPointer(gl_center, 3, GL.GL_FLOAT, GL.GL_FALSE, 3*coords.itemsize, ctypes.c_void_p(0))
-        
-        
-        
-        colors_idx = self.vm_object.color_indexes
-        self.sel_vao = True
-        """
-        self._make_gl_sel_representation_vao_and_vbos (indexes    = indexes    ,
-                                                       coords     = coords     ,
-                                                       colors     = colors_idx ,
-                                                       dot_sizes  = None       ,
-                                                       )
-        """
-    def draw_representation (self):
-        """ Function doc """
-        self._check_vao_and_vbos ()
-        #self._enable_anti_alias_to_lines()
-        
-        
-        
-        
-        GL.glEnable(GL.GL_DEPTH_TEST)
-        GL.glDisable(GL.GL_CULL_FACE)
-        #GL.glCullFace(GL.GL_BACK)
-        view = self.vm_glcore.glcamera.view_matrix
-        
-        GL.glUseProgram(self.shader_program )
-        
-        #print (self.vm_object.model_mat,view)
-        
-        m_normal = np.array(np.matrix(np.dot(view, self.vm_object.model_mat)).I.T)
-        
-        self.vm_glcore.load_matrices(self.shader_program , self.vm_object.model_mat)
-        self.vm_glcore.load_lights  (self.shader_program )
-        self.vm_glcore.load_fog     (self.shader_program )
-        GL.glBindVertexArray(self.vao)
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        """
-        #print ("DotsRepresentation")
-        height = self.vm_glcore.height
-        
-        GL.glUseProgram(self.shader_program)
-        #1*self.height dot_size
-        #GL.glLineWidth(40/abs(self.vm_glcore.dist_cam_zrp))
-        GL.glPointSize(0.1*height/abs(self.vm_glcore.dist_cam_zrp)) # dot size not included yet
-        self.vm_glcore.load_matrices(self.shader_program, self.vm_object.model_mat)
-        self.vm_glcore.load_fog(self.shader_program)
-        GL.glBindVertexArray(self.vao)
-        """
-        if self.vm_glcore.modified_view:
-            pass
-        
-        else:
-            """
-            This function checks if the number of the called frame will not exceed 
-            the limit of frames that each object has. Allowing two objects with 
-            different trajectory sizes to be manipulated at the same time within the 
-            glArea"""
-            # self._set_coordinates_to_buffer(coord_vbo = True, sel_coord_vbo = False)
-            #GL.glDrawElements(GL.GL_POINTS, int(len(self.indexes2)), GL.GL_UNSIGNED_INT, None)
-            #GL.glDrawElements(GL.GL_LINE_LOOP, int(len(self.coords2)), GL.GL_UNSIGNED_INT, None)
-            #GL.glDrawElements(GL.GL_LINE_STRIP, int(len(self.indexes2)), GL.GL_UNSIGNED_INT, None)
-            
-            #print("int(len(self.indexes2))", int(len(self.indexes2)))
-            GL.glDrawElements(GL.GL_TRIANGLES, int(len(self.indexes2)), GL.GL_UNSIGNED_INT, None)
-            #GL.glDrawElements(GL.GL_TRIANGLES, 54060, GL.GL_UNSIGNED_INT, None)
-        
-        #GL.glBindVertexArray(0)
-        #GL.glLineWidth(1)
-        #GL.glUseProgram(0)
-        #GL.glDisable(GL.GL_LINE_SMOOTH)
-        #GL.glDisable(GL.GL_BLEND)
-        GL.glDisable(GL.GL_DEPTH_TEST)
-        
-            
-    def draw_background_sel_representation  (self):
-        """ Function doc """
-        pass
-
-
 class SurfaceRepresentation(Representation):
     """ Class doc """
     
@@ -2241,16 +2033,99 @@ class SurfaceRepresentation(Representation):
         #if self.sel_vao is None:
         #    self._make_gl_sel_representation_vao_and_vbos()
 
-class CartoonRepresentation(Representation):
-    def __init__ (self, name = 'cartoon', active = True, rep_type = 'mol', vismol_object = None, vismol_glcore = None, indexes = []):
-        self.name               = name
-        self.active             = active
-        self.type               = rep_type
+def _cartoon_settings_from_gl_parameters ( gl_parameters ):
+    """ [EN] Builds a ribbon_geometry-compatible settings dict (see
+    DEFAULT_CARTOON_SETTINGS in vismol.utils.ribbon_geometry) from this
+    session's own gl_parameters -- the "Preferences > Cartoon" tab (user
+    request: adjustable ribbon thickness + a "variable criterion" for
+    helix/strand assignment; see setup_interface.py/.glade's
+    'cartoon_*' widgets and __apply_cartoon_parameters()) writes its
+    values there under the 'cartoon_*' keys, read here with .get(...,
+    default) against ribbon_geometry's OWN defaults -- so a
+    .config.json that predates this feature (missing every 'cartoon_*'
+    key) falls back to exactly the same look the app already shipped
+    with, no migration needed. The 2 '*_tolerance' keys are stored as a
+    PERCENTAGE in gl_parameters (100 = published P-SEA values, matching
+    how the Preferences entry field reads "100%"), converted to the
+    0-1-scale-factor form ribbon_geometry's classify_secondary_structure()
+    expects. 'cartoon_coil_radius' is a single UI value applied to BOTH
+    of ribbon_geometry's coil_half_width/coil_half_height (coil is
+    rendered round, so only one thickness concept makes sense there). """
+    from vismol.utils.ribbon_geometry import DEFAULT_CARTOON_SETTINGS
+    d = DEFAULT_CARTOON_SETTINGS
+    coil_radius = gl_parameters.get ( 'cartoon_coil_radius', d['coil_half_width'] )
+    return {
+        'helix_half_width':      gl_parameters.get ( 'cartoon_helix_width',   d['helix_half_width'] ),
+        'helix_half_height':     gl_parameters.get ( 'cartoon_helix_height',  d['helix_half_height'] ),
+        'strand_half_width':     gl_parameters.get ( 'cartoon_strand_width',  d['strand_half_width'] ),
+        'strand_half_height':    gl_parameters.get ( 'cartoon_strand_height', d['strand_half_height'] ),
+        'arrow_half_width':      gl_parameters.get ( 'cartoon_arrow_width',   d['arrow_half_width'] ),
+        'arrow_tip_half_width':  d['arrow_tip_half_width'],
+        'coil_half_width':       coil_radius,
+        'coil_half_height':      coil_radius,
+        'color_helix':  tuple ( gl_parameters.get ( 'cartoon_color_helix',  d['color_helix'] ) ),
+        'color_strand': tuple ( gl_parameters.get ( 'cartoon_color_strand', d['color_strand'] ) ),
+        'color_coil':   tuple ( gl_parameters.get ( 'cartoon_color_coil',   d['color_coil'] ) ),
+        'helix_tolerance_scale':  gl_parameters.get ( 'cartoon_helix_tolerance',  d['helix_tolerance_scale']  * 100.0 ) / 100.0,
+        'strand_tolerance_scale': gl_parameters.get ( 'cartoon_strand_tolerance', d['strand_tolerance_scale'] * 100.0 ) / 100.0,
+        'min_run': int ( gl_parameters.get ( 'cartoon_min_run', d['min_run'] ) ),
+    }
 
-        self.vm_object          = vismol_object
-        self.vm_glcore          = vismol_glcore
-        
-        # representation 	
+
+class CartoonRepresentation(Representation):
+    """ [EN] Independent Cartoon (ribbon) representation -- user's own
+    explicit request: a from-scratch implementation, not influenced by
+    the one this replaces, JMOL-like aesthetic (flat ribbons for helix/
+    strand with an arrowhead on strands, a thin tube through coil/loop).
+
+    ALL of the actual spline/secondary-structure/mesh-building work lives
+    in vismol.utils.ribbon_backbone (chain-aware backbone extraction + a
+    fresh P-SEA-style Ca-only H/S/C classifier) and vismol.utils.
+    ribbon_geometry (Catmull-Rom spline, per-residue orientation frames
+    with a flip-consistency pass, per-SS cross-section extrusion into a
+    triangle mesh) -- this class owns ONLY the GL side (VAO/VBO upload +
+    draw), same "fully generated geometry, nothing to do with vm_object's
+    own per-atom frames/colors arrays" situation SurfaceRepresentation
+    already has (its own _make_gl_representation_vao_and_vbos() override,
+    just above in this same file, is the pattern this mirrors).
+
+    Deliberately does NOT call Representation.__init__() (its positional
+    `indexes` argument assumes atom/bond-derived indexes, which doesn't
+    apply to a wholly generated mesh) -- sets the same attribute set by
+    hand instead, matching this file's own established convention for
+    "fully custom geometry" representations.
+
+    Live trajectory/frame rebuild (user's own later follow-up request --
+    this used to be a documented v1 limitation, mesh built ONCE at
+    construction time): draw_representation() below now rebuilds the
+    whole mesh from scratch whenever was_rep_coord_modified is set (the
+    same dirty flag every frame-advance already sets on every active
+    representation, see vm_glcore.render()'s own "updated_coords"
+    block) -- see rebuild() and draw_representation()'s own comments for
+    why a full rebuild, not a cheap coordinate-only update, is what a new
+    frame actually needs here. """
+
+    def __init__ ( self, vismol_object, vismol_glcore, name = 'cartoon', active = True ):
+        self.name       = name
+        self.active     = active
+        self.vm_object  = vismol_object
+        self.vm_session = vismol_object.vm_session
+        self.vm_glcore  = vismol_glcore
+
+        self.uses_uniform_color = True
+        self.is_dynamic = False
+
+        self.was_rep_modified       = False
+        self.was_sel_modified       = False
+        self.was_col_modified       = False
+        self.was_rep_coord_modified = False
+        self.was_sel_coord_modified = False
+        self.was_rep_ind_modified   = False
+        self.was_sel_ind_modified   = False
+        self.was_rep_col_modified   = False
+        self._last_uploaded_sel_ids = None
+
+        # representation
         self.vao            = None
         self.ind_vbo        = None
         self.coord_vbo      = None
@@ -2270,148 +2145,183 @@ class CartoonRepresentation(Representation):
         #     S H A D E R S
         self.shader_program     = None
         self.sel_shader_program = None
-        
-        import vismol.utils.cartoon_BCK as cartoon
-        
-        coords, normals, indexes, colors = cartoon.cartoon(vismol_object, spline_detail=5)
-        
-        # [EN] BUG FIX: this used to store these as self.coords2/colors2/
-        # normals2/indexes2 (note the "2" suffix) -- but every OTHER
-        # piece of machinery that touches a representation's geometry
-        # (the base Representation._make_gl_representation_vao_and_vbos(),
-        # draw_representation() a few lines below, etc.) expects the
-        # PLAIN, un-suffixed names (self.coords/self.colors/self.normals/
-        # self.indexes), matching every other representation type (see
-        # SurfaceRepresentation, which faces the exact same "fully custom,
-        # non vm_object.frames-based geometry" situation cartoon does).
-        # The "2" suffix meant every read of these fields elsewhere raised
-        # AttributeError the moment Cartoon was actually drawn. Also now
-        # explicitly cast to the dtypes the GL buffer helpers expect --
-        # this exact cast used to exist here (as a triple-quoted, disabled
-        # block) and was never actually applied.
-        self.coords  = np.ascontiguousarray(coords,  dtype=np.float32)
-        self.colors  = np.ascontiguousarray(colors,  dtype=np.float32)
-        self.normals = np.ascontiguousarray(normals, dtype=np.float32)
-        self.indexes = np.ascontiguousarray(indexes, dtype=np.uint32)
 
-    def _make_gl_representation_vao_and_vbos(self, debug = False):
+        # [EN] User request (round 8 -- "Preferences: cartoon dinamico ou
+        # nao, por padrao nao"): per-chain H/S/C classification cache, see
+        # rebuild()'s own docstring below for the full story. None here
+        # means "nothing cached yet" -- the very first build (right below)
+        # always classifies fresh, same as before this cache existed.
+        self._cached_ss_codes = None
+
+        from vismol.utils.ribbon_geometry import build_ribbon_mesh_for_object
+        gl_parameters = getattr ( self.vm_session.vm_config, 'gl_parameters', {} )
+        settings = _cartoon_settings_from_gl_parameters ( gl_parameters )
+        coords, normals, colors, indexes, ss_codes_per_chain = build_ribbon_mesh_for_object (
+            vismol_object, spline_detail = 5, settings = settings, return_ss_codes = True )
+        self._cached_ss_codes = ss_codes_per_chain
+
+        self.coords  = np.ascontiguousarray ( coords,  dtype = np.float32 )
+        self.colors  = np.ascontiguousarray ( colors,  dtype = np.float32 )
+        self.normals = np.ascontiguousarray ( normals, dtype = np.float32 )
+        self.indexes = np.ascontiguousarray ( indexes, dtype = np.uint32 )
+        self.elements = np.uint32 ( self.indexes.shape[0] )
+
+    def rebuild ( self, force_reclassify = False ):
+        """ [EN] Re-runs the mesh build (current gl_parameters settings,
+        current frame -- build_ribbon_mesh_for_object()'s own frame=None
+        default resolves to "whichever frame is active for THIS object
+        right now", so this naturally picks up trajectory playback too)
+        and marks the GL buffers stale so the next draw goes through the
+        base class's _check_vao_and_vbos() (triggers on `self.vao is
+        None`) and rebuilds them from the fresh geometry. Two callers:
+        setup_interface.py's __apply_cartoon_parameters()/reset (with
+        force_reclassify=True -- a Preferences change, including to the
+        classification tolerances themselves, must always be reflected
+        immediately, never silently skipped by the cache below); and
+        draw_representation() below (force_reclassify=False, the
+        default), whenever was_rep_coord_modified says the session's
+        current frame just changed (trajectory navigation/MD playback).
+        Old VBO/VAO ids are simply replaced (not explicitly glDelete'd)
+        -- the same lightweight "just overwrite the attribute" convention
+        this codebase already uses for other forced-rebuild cases (e.g.
+        picking_dots reset to None in setup_interface.py's
+        color_set_viewing_selections()).
+
+        [EN] User request (round 8 -- "cartoon dinamico ou nao, por
+        padrao nao, ou seja, o que e helice ou fita nao muda com a troca
+        de frames"): classify_secondary_structure() turned out to be
+        ~45% of a rebuild's total cost once build_ribbon_mesh() itself
+        got vectorized (round 7's own profiling) -- re-running it on
+        EVERY trajectory frame is both wasted work (a single, rigid
+        protein's SS assignment realistically doesn't change frame to
+        frame in the vast majority of real use) and a source of visible
+        flicker if it's borderline/noisy across frames. Controlled by
+        gl_parameters['cartoon_dynamic_secondary_structure'] (Preferences
+        > Cartoon, default OFF): OFF (the default) reuses this
+        representation's own cached per-chain classification instead of
+        recomputing it (build_ribbon_mesh_for_object()'s own
+        `cached_ss_codes` parameter, which additionally guards against a
+        length mismatch -- e.g. a genuine topology change mid-trajectory
+        -- by falling back to a fresh classification for that one chain
+        only); ON always reclassifies, matching round 6/7's original
+        behaviour. Either way the cache is refreshed with whatever was
+        actually used this call, so toggling the setting later picks up
+        cleanly from wherever playback currently is. """
+        from vismol.utils.ribbon_geometry import build_ribbon_mesh_for_object
+        gl_parameters = getattr ( self.vm_session.vm_config, 'gl_parameters', {} )
+        settings = _cartoon_settings_from_gl_parameters ( gl_parameters )
+        dynamic_ss = bool ( gl_parameters.get ( 'cartoon_dynamic_secondary_structure', False ) )
+        cached = None if ( force_reclassify or dynamic_ss ) else self._cached_ss_codes
+        coords, normals, colors, indexes, ss_codes_per_chain = build_ribbon_mesh_for_object (
+            self.vm_object, spline_detail = 5, settings = settings,
+            cached_ss_codes = cached, return_ss_codes = True )
+        self._cached_ss_codes = ss_codes_per_chain
+
+        self.coords  = np.ascontiguousarray ( coords,  dtype = np.float32 )
+        self.colors  = np.ascontiguousarray ( colors,  dtype = np.float32 )
+        self.normals = np.ascontiguousarray ( normals, dtype = np.float32 )
+        self.indexes = np.ascontiguousarray ( indexes, dtype = np.uint32 )
+        self.elements = np.uint32 ( self.indexes.shape[0] )
+        self.vao     = None
+        self.sel_vao = None
+
+    def _make_gl_representation_vao_and_vbos ( self, debug = False ):
         """ [EN] Overrides the base Representation version (which reads
         self.vm_object.frames[0]/self.vm_object.colors -- the whole
-        object's plain atom buffers) because Cartoon's geometry, like
-        Surface's, is entirely generated (a spline-interpolated ribbon
-        mesh, produced by cartoon_BCK.cartoon() in __init__ above) and
-        has nothing to do with vm_object's own per-atom arrays -- neither
-        the vertex COUNT nor the ORDER match. Mirrors
-        SurfaceRepresentation._make_gl_representation_vao_and_vbos()'s
-        pattern, adapted for cartoon's own attribute names and its
-        shader's "vert_norm" attribute (SurfaceRepresentation's own
-        _make_gl_normal_buffer() targets "vert_normal" instead -- a
-        different name, matching ITS shader -- so it can't be reused
-        as-is here; see _make_gl_normal_buffer() below). """
+        object's plain per-atom buffers) because Cartoon's geometry, like
+        Surface's, is entirely generated (a spline-extruded ribbon mesh,
+        built in __init__ above by vismol.utils.ribbon_geometry) and has
+        nothing to do with vm_object's own per-atom arrays -- neither the
+        vertex COUNT nor the ORDER match. Mirrors SurfaceRepresentation's
+        own override of this same method, just above in this file. """
         if debug:
-            logger.debug("building '{}' representation VAO and VBOs".format(self.name))
-        self.vao       = self._make_gl_vao()
-        self.ind_vbo   = self._make_gl_index_buffer(self.indexes)
-        self.coord_vbo = self._make_gl_coord_buffer(self.coords, self.shader_program)
-        self.col_vbo   = self._make_gl_color_buffer(self.colors, self.shader_program)
-        self.norm_vbo  = self._make_gl_normal_buffer(self.normals, self.shader_program)
+            logger.debug ( "building '{}' representation VAO and VBOs".format ( self.name ) )
+        self.vao       = self._make_gl_vao ( )
+        self.ind_vbo   = self._make_gl_index_buffer ( self.indexes )
+        self.coord_vbo = self._make_gl_coord_buffer ( self.coords, self.shader_program )
+        self.col_vbo   = self._make_gl_color_buffer ( self.colors, self.shader_program )
+        self.norm_vbo  = self._make_gl_normal_buffer ( self.normals, self.shader_program )
 
-    def _make_gl_normal_buffer(self, normals, program):
-        """ Buffer de normais por vertice, pro atributo 'vert_norm' que o
-        shader de cartoon declara (ver shaders/cartoon.py -- note que e
-        'vert_norm', nao 'vert_normal' como no shader de superficie). """
-        norm_vbo = GL.glGenBuffers(1)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, norm_vbo)
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, normals.nbytes, normals, GL.GL_STATIC_DRAW)
-        att_normal = GL.glGetAttribLocation(program, "vert_norm")
-        GL.glEnableVertexAttribArray(att_normal)
-        GL.glVertexAttribPointer(att_normal, 3, GL.GL_FLOAT, GL.GL_FALSE, 3*normals.itemsize, ctypes.c_void_p(0))
+    def _make_gl_normal_buffer ( self, normals, program ):
+        """ Per-vertex normal buffer for the shader's own "vert_norm"
+        attribute (shaders/cartoon.py) -- the base Representation class
+        has no normal-buffer helper of its own (most representation
+        types don't need per-vertex normals), so this mirrors the base
+        class's own _make_gl_coord_buffer()/_make_gl_color_buffer()
+        pattern for the one extra attribute Cartoon's shader needs. """
+        norm_vbo = GL.glGenBuffers ( 1 )
+        GL.glBindBuffer ( GL.GL_ARRAY_BUFFER, norm_vbo )
+        GL.glBufferData ( GL.GL_ARRAY_BUFFER, normals.nbytes, normals, GL.GL_STATIC_DRAW )
+        att_normal = GL.glGetAttribLocation ( program, "vert_norm" )
+        GL.glEnableVertexAttribArray ( att_normal )
+        GL.glVertexAttribPointer ( att_normal, 3, GL.GL_FLOAT, GL.GL_FALSE, 3 * normals.itemsize, ctypes.c_void_p ( 0 ) )
         return norm_vbo
 
-    def _make_gl_sel_representation_vao_and_vbos(self, debug = False):
+    def _make_gl_sel_representation_vao_and_vbos ( self, debug = False ):
         """ [EN] Background/picking VAO -- reuses the exact same geometry
         and colours as the main representation (NOT real per-vertex pick
         colours, which would need one unique colour per pickable unit;
-        out of scope here -- click-to-select on a Cartoon ribbon isn't
-        implemented). This exists purely so _check_vao_and_vbos() (which
-        unconditionally builds both the main AND the sel VAO the first
-        time a representation is drawn) has something valid to build
-        instead of crashing on the same self.indexes/self.vm_object.
-        frames[0] mismatch the main VAO override above avoids. """
+        out of scope -- click-to-select on a Cartoon ribbon isn't
+        implemented, same as the representation this replaces). Exists
+        purely so _check_vao_and_vbos() (which unconditionally builds
+        both the main AND the sel VAO the first time a representation is
+        drawn) has something valid to build. """
         if debug:
-            logger.debug("building '{}' background selection VAO and VBOs".format(self.name))
-        self.sel_vao       = self._make_gl_vao()
-        self.sel_ind_vbo   = self._make_gl_index_buffer(self.indexes)
-        self.sel_coord_vbo = self._make_gl_coord_buffer(self.coords, self.sel_shader_program)
-        self.sel_col_vbo   = self._make_gl_color_buffer(self.colors, self.sel_shader_program)
+            logger.debug ( "building '{}' background selection VAO and VBOs".format ( self.name ) )
+        self.sel_vao       = self._make_gl_vao ( )
+        self.sel_ind_vbo   = self._make_gl_index_buffer ( self.indexes )
+        self.sel_coord_vbo = self._make_gl_coord_buffer ( self.coords, self.sel_shader_program )
+        self.sel_col_vbo   = self._make_gl_color_buffer ( self.colors, self.sel_shader_program )
 
-    def draw_representation (self):
-        """ Function doc """
-        self._check_vao_and_vbos ()
-        #self._enable_anti_alias_to_lines()
-        
-        GL.glEnable(GL.GL_DEPTH_TEST)
-        GL.glDisable(GL.GL_CULL_FACE)
-        #GL.glCullFace(GL.GL_BACK)
-        view = self.vm_glcore.glcamera.view_matrix
-        
-        GL.glUseProgram(self.shader_program )
-        
-        #print (self.vm_object.model_mat,view)
-        
-        m_normal = np.array(np.matrix(np.dot(view, self.vm_object.model_mat)).I.T)
-        
-        self.vm_glcore.load_matrices(self.shader_program , self.vm_object.model_mat)
-        self.vm_glcore.load_lights  (self.shader_program )
-        self.vm_glcore.load_fog     (self.shader_program )
-        GL.glBindVertexArray(self.vao)
-        GL.glDrawElements(GL.GL_TRIANGLES, int(len(self.indexes)), GL.GL_UNSIGNED_INT, None)
-        GL.glDisable(GL.GL_DEPTH_TEST)
-        
-        
-        
-        
-        
-        
-        
-        #"""
-        ##print ("DotsRepresentation")
-        #height = self.vm_glcore.height
-        #
-        #GL.glUseProgram(self.shader_program)
-        ##1*self.height dot_size
-        ##GL.glLineWidth(40/abs(self.vm_glcore.dist_cam_zrp))
-        #GL.glPointSize(0.1*height/abs(self.vm_glcore.dist_cam_zrp)) # dot size not included yet
-        #self.vm_glcore.load_matrices(self.shader_program, self.vm_object.model_mat)
-        #self.vm_glcore.load_fog(self.shader_program)
-        #GL.glBindVertexArray(self.vao)
-        #"""
-        #if self.vm_glcore.modified_view:
-        #    pass
-        #
-        #else:
-        #    """
-        #    This function checks if the number of the called frame will not exceed 
-        #    the limit of frames that each object has. Allowing two objects with 
-        #    different trajectory sizes to be manipulated at the same time within the 
-        #    glArea"""
-        #    # self._set_coordinates_to_buffer(coord_vbo = True, sel_coord_vbo = False)
-        #    #GL.glDrawElements(GL.GL_POINTS, int(len(self.indexes2)), GL.GL_UNSIGNED_INT, None)
-        #    #GL.glDrawElements(GL.GL_LINE_LOOP, int(len(self.coords2)), GL.GL_UNSIGNED_INT, None)
-        #    #GL.glDrawElements(GL.GL_LINE_STRIP, int(len(self.indexes2)), GL.GL_UNSIGNED_INT, None)
-        #    
-        #    #print("int(len(self.indexes2))", int(len(self.indexes2)))
-        #    GL.glDrawElements(GL.GL_TRIANGLES, int(len(self.indexes2)), GL.GL_UNSIGNED_INT, None)
-        #    #GL.glDrawElements(GL.GL_TRIANGLES, 54060, GL.GL_UNSIGNED_INT, None)
-        #
-        ##GL.glBindVertexArray(0)
-        ##GL.glLineWidth(1)
-        ##GL.glUseProgram(0)
-        ##GL.glDisable(GL.GL_LINE_SMOOTH)
-        ##GL.glDisable(GL.GL_BLEND)
-        #GL.glDisable(GL.GL_DEPTH_TEST)
-                    
-    def draw_background_sel_representation  (self):
+    def draw_representation ( self ):
+        # [EN] User request: "extender a representacao para todos os
+        # frames de uma trajetoria" -- was previously a documented v1
+        # limitation (mesh built ONCE, at construction). vm_glcore.render()
+        # already marks was_rep_coord_modified=True on every ACTIVE
+        # representation of every object whenever the session's current
+        # frame advances (see the "updated_coords" block near the top of
+        # render() in vismol_glcore.py -- the same flag every atom-based
+        # representation already consumes to re-upload just its coord
+        # VBO). Cartoon can't do the cheap "just update positions" thing
+        # those do, since a new frame's geometry can change EVERYTHING a
+        # rebuild computes from scratch -- the spline shape, each
+        # residue's side/orientation vector, even its P-SEA secondary-
+        # structure classification (a real MD trajectory can genuinely
+        # unfold/refold) -- so this reuses the exact same rebuild() the
+        # Preferences "Apply" flow already added: a full re-run of
+        # build_ribbon_mesh_for_object(), reusing its own frame=None
+        # default, which already resolves to "whichever frame is
+        # currently active for THIS object" (Atom.coords()'s own
+        # per-object frame-pin/clamping logic -- unchanged, nothing
+        # cartoon-specific needed here). rebuild() sets self.vao = None,
+        # so the _check_vao_and_vbos() call right below picks it straight
+        # back up and re-uploads fresh GL buffers, same lazy-rebuild path
+        # every other representation already uses.
+        if self.was_rep_coord_modified:
+            self.rebuild ( )
+            self.was_rep_coord_modified = False
+            self.was_sel_coord_modified = False
+
+        self._check_vao_and_vbos ( )
+
+        GL.glEnable ( GL.GL_DEPTH_TEST )
+        # [EN] A ribbon is a THIN, open surface (helix/strand cross-
+        # sections are only ~0.5 A tall) -- both sides are visible from
+        # many camera angles, so face culling stays off; the shader's own
+        # gl_FrontFacing-based normal flip (shaders/cartoon.py) is what
+        # keeps lighting correct on both sides of the same surface.
+        GL.glDisable ( GL.GL_CULL_FACE )
+
+        GL.glUseProgram ( self.shader_program )
+        self.vm_glcore.load_matrices ( self.shader_program, self.vm_object.model_mat )
+        self.vm_glcore.load_lights   ( self.shader_program )
+        self.vm_glcore.load_fog      ( self.shader_program )
+
+        GL.glBindVertexArray ( self.vao )
+        GL.glDrawElements ( GL.GL_TRIANGLES, int ( len ( self.indexes ) ), GL.GL_UNSIGNED_INT, None )
+        GL.glDisable ( GL.GL_DEPTH_TEST )
+
+    def draw_background_sel_representation ( self ):
         """ Function doc """
         pass
 

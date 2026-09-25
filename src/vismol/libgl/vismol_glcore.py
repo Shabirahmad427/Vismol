@@ -1515,6 +1515,19 @@ class VismolGLCore:
             #'''
         
         
+        elif getattr(self.vm_session, "builder_atom_mode", False):
+            # [EN] 2026-09-25, user's own explicit request: "enquanto o
+            # modo 'editing' estiver 'on', nao mostrar nenhuma selecao"
+            # -- suppresses the viewing-selection dots (and the drag-box
+            # preview below) while the Builder's own "Editing: ON/OFF"
+            # toggle is on, EVEN IF a selection was already made earlier
+            # while paused (Editing off) -- this is a pure RENDERING
+            # suppression; the underlying selected_atoms set is left
+            # untouched, so it reappears exactly as it was the moment
+            # Editing is switched back off (see vismol_session.py's own
+            # _selection_function_set(), which separately blocks NEW
+            # selection changes from being made at all while this is on).
+            pass
         else:
             '''                    - - -  V I E W I N G   S E L E C T I O N S - - -                  '''
             '''                               drawing blues dot selections                           '''
@@ -1541,7 +1554,8 @@ class VismolGLCore:
                     pdots._last_uploaded_sel_ids = set(sel_ids)
                 pdots.draw_representation()
         
-        if not self.vm_session.picking_selection_mode and self.show_selection_box and self.shift:
+        if ( not self.vm_session.picking_selection_mode and self.show_selection_box and self.shift
+             and not getattr(self.vm_session, "builder_atom_mode", False) ):
             if self.selection_box.vao is None:
                 self.selection_box._make_gl_selection_box()
             else:
@@ -3008,10 +3022,14 @@ class VismolGLCore:
     # "cartoon" never actually landed in self.shader_programs, and the
     # very first attempt to draw a Cartoon representation crashed with
     # KeyError('cartoon') in representations.py's _check_vao_and_vbos().
-    # Restored to live code now that calculate_secondary_structure()'s
-    # actual bug (see cartoon_BCK.py) is fixed -- that was almost
-    # certainly the original reason this got commented out and marked
-    # "not implemented yet" to begin with.
+    # Restored to live code once the underlying secondary-structure-
+    # classification bug (originally in the now-replaced cartoon_BCK.py --
+    # see the independent CartoonRepresentation/ribbon_backbone.py that
+    # replaced it) was fixed -- that was almost certainly the original
+    # reason this got commented out and marked "not implemented yet" to
+    # begin with. Untouched by that replacement: still just loads
+    # shaders/cartoon.py's own v_shader_triangles/f_shader_triangles
+    # (now an independently-written shader pair, same export names).
     def _compile_shader_cartoon(self):
         """ Function doc """
         self.shader_programs["cartoon"] = self.load_shaders(shaders_cartoon.v_shader_triangles,
