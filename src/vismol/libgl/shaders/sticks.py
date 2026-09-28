@@ -131,7 +131,15 @@ uniform float u_separation;
 // GL_LINES, gl_PrimitiveIDIn == k. Isso pareia a ordem 1:1 com cada par de
 // index_bonds, sem qualquer ambiguidade por atomo compartilhado (o problema
 // do esquema antigo, que usava um atributo por-vertice/por-atomo).
+// [EN] 2026-09-28 (macOS report, "unsigned-integer texture warning during
+// picking"): the picking program never binds this texture, and in a core
+// profile an unbound sampler does NOT read as 0 -- it samples whatever
+// texture sits on unit 0 (type mismatch -> driver warning/undefined
+// result). The picking variant (sel_geometry_shader_sticks, below) is
+// compiled with PICKING_PASS defined, which removes the sampler entirely.
+#ifndef PICKING_PASS
 uniform usamplerBuffer u_bond_order_tbo;
+#endif
 
 in vec3 geom_color[];
 in vec4 geom_coord[];
@@ -532,11 +540,15 @@ void emit_cylinder(){
 void main(){
     // Ordem da ligacao: um texel por ligacao, indexado pela primitiva atual
     // (gl_PrimitiveIDIn == k-esimo par de self.index_bonds == bond_order_list[k]).
-    // Se a textura nao estiver vinculada (ex.: programa de selecao/picking,
-    // que nao precisa de ordem correta -- desenha so a passada 0 com
-    // u_separation=0), texelFetch retorna 0, que o clamp abaixo trata como
-    // ligacao simples (comportamento seguro default).
+    // No picking (PICKING_PASS) a ordem nao importa -- desenha so a passada 0
+    // com u_separation=0 -- entao e fixada em 1 (ligacao simples), sem ler
+    // nenhuma textura (uma textura NAO vinculada nao retorna 0 no core
+    // profile; le o que estiver na unidade 0).
+#ifdef PICKING_PASS
+    int order = 1;
+#else
     int order = int(texelFetch(u_bond_order_tbo, gl_PrimitiveIDIn).r);
+#endif
     if (order < 1) order = 1;
     if (order > 3) order = 3;
 
@@ -612,6 +624,7 @@ uniform Light my_light;
 uniform vec4 fog_color;
 uniform float fog_start;
 uniform float fog_end;
+uniform float fog_intensity;
 
 in vec3 frag_coord;
 in vec3 frag_color;
@@ -643,7 +656,7 @@ void main(){
     
     float dist = abs(frag_coord.z);
     if(dist>=fog_start){
-        float fog_factor = (fog_end-dist)/(fog_end-fog_start);
+        float fog_factor = 1.0 - fog_intensity * (1.0 - clamp((fog_end-dist)/(fog_end-fog_start), 0.0, 1.0));
         final_color = mix(fog_color, out_color, fog_factor);
     }
     else{
@@ -928,6 +941,7 @@ uniform Light my_light;
 uniform vec4 fog_color;
 uniform float fog_start;
 uniform float fog_end;
+uniform float fog_intensity;
 
 in vec3 frag_color;
 in vec3 frag_coord;
@@ -1066,11 +1080,17 @@ void main() {
 }
 """
 
+# Picking variant of geometry_shader_sticks: identical except PICKING_PASS is
+# defined right after the #version line (GLSL requires #version first), which
+# drops the bond-order sampler -- see the comment at u_bond_order_tbo above.
+sel_geometry_shader_sticks = geometry_shader_sticks.replace(
+    "#version 330", "#version 330\n#define PICKING_PASS", 1)
+
 shader_type ={0: {"vertex_shader"      : vertex_shader_sticks,
                   "geometry_shader"    : geometry_shader_sticks,
                   "fragment_shader"    : fragment_shader_sticks,
                   "sel_vertex_shader"  : vertex_shader_sticks,
-                  "sel_geometry_shader": geometry_shader_sticks,
+                  "sel_geometry_shader": sel_geometry_shader_sticks,
                   "sel_fragment_shader": sel_fragment_shader_sticks
                  },
               1: {"vertex_shader"      : vertex_shader_impostor_sticks,
@@ -1084,14 +1104,14 @@ shader_type ={0: {"vertex_shader"      : vertex_shader_sticks,
                   "geometry_shader"    : geometry_shader_sticks,     
                   "fragment_shader"    : fragment_shader_sticks,     
                   "sel_vertex_shader"  : vertex_shader_ribbon_stick, 
-                  "sel_geometry_shader": geometry_shader_sticks,     
+                  "sel_geometry_shader": sel_geometry_shader_sticks,     
                   "sel_fragment_shader": sel_fragment_shader_sticks  
                     },
                3: {"vertex_shader"     : vertex_shader_ribbon_stick,
                   "geometry_shader"    : geometry_shader_sticks,
                   "fragment_shader"    : fragment_shader_sticks,
                   "sel_vertex_shader"  : vertex_shader_sticks,
-                  "sel_geometry_shader": geometry_shader_sticks,
+                  "sel_geometry_shader": sel_geometry_shader_sticks,
                   "sel_fragment_shader": sel_fragment_shader_sticks
                  },  
  

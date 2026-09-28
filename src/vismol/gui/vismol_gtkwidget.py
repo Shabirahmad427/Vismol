@@ -66,11 +66,19 @@ if _IS_MACOS:
 
     class _OffscreenGLContext:
         """ Owns a hidden GLFW window purely to hold an OpenGL 3.3 core
-            context and its default framebuffer -- never shown, never
-            attached to any GTK/AppKit view, so it never touches GTK's
-            Quartz compositing. Resized to match the DrawingArea's
-            current allocation before every draw (see
-            VismolGTKWidget._draw_macos).
+            context -- never shown, never attached to any GTK/AppKit view,
+            so it never touches GTK's Quartz compositing.
+
+            [EN] 2026-09-28 BUG FIX (macOS report: "black molecular view
+            after resizing"): rendering used to go to the hidden window's
+            DEFAULT framebuffer, resized with glfw.set_window_size() --
+            which is asynchronous on macOS, so the first draw after a
+            resize rendered/read back a framebuffer that did not have the
+            new size yet (black view until some later interaction). Now
+            everything renders into our own framebuffer object whose
+            color/depth renderbuffers are (re)allocated synchronously at
+            the widget's size in resize(); the hidden window's own size
+            no longer matters.
         """
 
         def __init__(self, width, height):
@@ -88,12 +96,72 @@ if _IS_MACOS:
             if not self._window:
                 glfw.terminate()
                 raise RuntimeError("Failed to create the hidden GLFW window for the offscreen macOS GL context.")
+            self._framebuffer  = None
+            self._color_buffer = None
+            self._depth_buffer = None
+            self._fb_size      = (0, 0)
 
         def make_current(self):
+            """ Makes the context current AND binds our framebuffer (once
+                it exists), so every caller -- the draw path, but also
+                capture_screenshot() -- renders into / reads from it. """
+            if self._window is None:
+                return
             glfw.make_context_current(self._window)
+            if self._framebuffer is not None:
+                glBindFramebuffer(GL_FRAMEBUFFER, self._framebuffer)
 
         def resize(self, width, height):
-            glfw.set_window_size(self._window, max(int(width), 1), max(int(height), 1))
+            """ Ensures the framebuffer exists and has exactly width x
+                height color (RGBA8) + depth (24 bit) storage; the storage
+                is only reallocated when the size actually changes. Leaves
+                the framebuffer bound. """
+            if self._window is None:
+                return
+            width, height = max(int(width), 1), max(int(height), 1)
+            glfw.make_context_current(self._window)
+            if self._framebuffer is None:
+                self._framebuffer  = glGenFramebuffers(1)
+                self._color_buffer = glGenRenderbuffers(1)
+                self._depth_buffer = glGenRenderbuffers(1)
+            glBindFramebuffer(GL_FRAMEBUFFER, self._framebuffer)
+            if (width, height) == self._fb_size:
+                return
+            glBindRenderbuffer(GL_RENDERBUFFER, self._color_buffer)
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width, height)
+            glBindRenderbuffer(GL_RENDERBUFFER, self._depth_buffer)
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, width, height)
+            glBindRenderbuffer(GL_RENDERBUFFER, 0)
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                      GL_RENDERBUFFER, self._color_buffer)
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                      GL_RENDERBUFFER, self._depth_buffer)
+            status = glCheckFramebufferStatus(GL_FRAMEBUFFER)
+            if status != GL_FRAMEBUFFER_COMPLETE:
+                self._fb_size = (0, 0)
+                raise RuntimeError("Offscreen macOS framebuffer incomplete (status 0x{:x}) "
+                                   "at {}x{}".format(int(status), width, height))
+            self._fb_size = (width, height)
+
+        def close(self):
+            """ Deletes the framebuffer/renderbuffers and destroys the
+                hidden window (connected to the widget's "destroy"). Safe
+                to call more than once. """
+            if self._window is None:
+                return
+            try:
+                glfw.make_context_current(self._window)
+                glBindFramebuffer(GL_FRAMEBUFFER, 0)
+                if self._framebuffer is not None:
+                    glDeleteFramebuffers(1, [self._framebuffer])
+                    glDeleteRenderbuffers(2, [self._color_buffer, self._depth_buffer])
+            except Exception as error:
+                logger.debug("offscreen GL cleanup failed: {}".format(error))
+            finally:
+                self._framebuffer = self._color_buffer = self._depth_buffer = None
+                self._fb_size = (0, 0)
+                glfw.destroy_window(self._window)
+                self._window = None
 
 
 def _patch_gl_line_width():
@@ -122,6 +190,17 @@ def _patch_gl_line_width():
     def _clamped_glLineWidth(width):
         try:
             lo, hi = GL.glGetFloatv(GL.GL_ALIASED_LINE_WIDTH_RANGE)
+            # [EN] 2026-09-28: in a FORWARD-COMPATIBLE core context (what
+            # the macOS offscreen GLFW context must request) wide lines are
+            # removed by the spec -- any width > 1.0 is GL_INVALID_VALUE --
+            # yet some drivers still report a wide ALIASED range there
+            # (found running the macOS code path on Mesa: range [1, 255],
+            # glLineWidth(5.48) -> GLError 1281). Cap at 1.0 in that case.
+            # Linux Gtk.GLArea contexts are not forward-compatible, so
+            # nothing changes there.
+            flags = GL.glGetIntegerv(GL.GL_CONTEXT_FLAGS)
+            if int(flags) & GL.GL_CONTEXT_FLAG_FORWARD_COMPATIBLE_BIT:
+                hi = min(hi, 1.0)
             width = min(max(width, lo), hi)
         except Exception:
             pass
@@ -164,8 +243,16 @@ class VismolGTKWidget(_WidgetBase):
         if _IS_MACOS:
             self._gl_initialized = False
             self._gl_ctx = _OffscreenGLContext(width, height)
+            # [EN] 2026-09-28 BUG FIX: GL used to be initialized only on the
+            # first "draw" -- anything touching vm_glcore before that (e.g.
+            # easyhybrid.py loading a file passed on the command line right
+            # after the window is created) hit "VismolGLCore has no
+            # attribute 'model_mat'". Gtk.GLArea initializes on "realize"
+            # on Linux/Windows; do the same here.
+            self.connect("realize", lambda *args: self._ensure_gl_initialized_macos())
             self.connect("draw", self._draw_macos)
             self.connect("size-allocate", self._size_allocate_macos)
+            self.connect("destroy", lambda *args: self._gl_ctx.close())
             # vismol_glcore.initialize() calls these on self.parent_widget
             # expecting the real Gtk.GLArea API -- no-op instance-level
             # shims here since the offscreen GLFW window is always
@@ -192,6 +279,16 @@ class VismolGTKWidget(_WidgetBase):
                         | Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
                         | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.POINTER_MOTION_HINT_MASK
                         | Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.KEY_RELEASE_MASK)
+        if _IS_MACOS:
+            # [EN] 2026-09-28 (macOS report: two-finger trackpad clipping
+            # ignored) -- GTK3/Quartz delivers trackpad scrolling only as
+            # SMOOTH events (fractional deltas), which mouse_scroll() used
+            # to drop. Requested on macOS only: on Linux, without this
+            # mask, GTK keeps delivering the plain UP/DOWN events every
+            # mouse wheel and touchpad already works with today.
+            self.set_events(self.get_events() | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        self._scroll_remainder = 0.0
+        self._scroll_modifiers = None
         # self.vm_objects_list_store = Gtk.ListStore(bool,  # visible? 
         #                                            str,  # id
         #                                            str,  # name
@@ -276,22 +373,23 @@ class VismolGTKWidget(_WidgetBase):
                 glReadPixels, and blits it into the DrawingArea's Cairo
                 context.
             """
-            self._gl_ctx.make_current()
-            if not self._gl_initialized:
-                self._gl_initialized = True
-                self.vm_glcore.initialize()
-
             width  = self.get_allocated_width()
             height = self.get_allocated_height()
             if width <= 0 or height <= 0:
                 return True
 
+            # context current + framebuffer allocated at THIS size, bound
             self._gl_ctx.resize(width, height)
+            self._ensure_gl_initialized_macos()
+            # keep the camera/projection in step with the exact size being
+            # rendered (size-allocate may not have run yet for this frame)
+            self.vm_glcore.resize_window(width, height)
             # [EN] BUG FIX (macOS trackpad zoom appeared to drift the
-            # molecule sideways): glfw.set_window_size() above resizes the
-            # hidden GLFW window/framebuffer, but -- unlike Gtk.GLArea on
-            # Linux/Windows, which re-applies the GL viewport for you on
-            # every resize -- it does NOT itself touch the GL viewport.
+            # molecule sideways): resizing the offscreen framebuffer (now
+            # our own FBO, see _OffscreenGLContext.resize(); originally the
+            # hidden GLFW window) does NOT touch the GL viewport -- unlike
+            # Gtk.GLArea on Linux/Windows, which re-applies it for you on
+            # every resize.
             # Without this call the viewport stayed stuck at whatever size
             # the hidden window had when _OffscreenGLContext was first
             # created (the widget's construction-time default, 640x420),
@@ -323,12 +421,27 @@ class VismolGTKWidget(_WidgetBase):
             cr.paint()
             return True
 
+        def _ensure_gl_initialized_macos(self):
+            """ One-time vm_glcore.initialize() inside the offscreen
+                context (from "realize" or, at the latest, the first draw). """
+            if self._gl_initialized:
+                return
+            if self._gl_ctx._framebuffer is None:
+                self._gl_ctx.resize(max(self.get_allocated_width(), 1),
+                                    max(self.get_allocated_height(), 1))
+            else:
+                self._gl_ctx.make_current()
+            self._gl_initialized = True
+            self.vm_glcore.initialize()
+
         def _size_allocate_macos(self, widget, allocation):
             """ macOS-only resize path (Gtk.DrawingArea "size-allocate"
                 signal), equivalent to reshape() used by Gtk.GLArea on
                 Linux/Windows -- updates the camera/projection to match
                 the new size and asks for a redraw.
             """
+            if allocation.width <= 0 or allocation.height <= 0:
+                return
             self.vm_glcore.resize_window(allocation.width, allocation.height)
             self.queue_draw()
 
@@ -356,11 +469,61 @@ class VismolGTKWidget(_WidgetBase):
     def mouse_scroll(self, widget, event):
         """ Function doc
         """
+        if event.direction == Gdk.ScrollDirection.SMOOTH:
+            self._mouse_scroll_smooth(event)
+            return
+        # a discrete wheel event discards any partial trackpad movement
+        self._scroll_remainder = 0.0
         if event.direction == Gdk.ScrollDirection.UP:
             self.vm_glcore.mouse_scroll(1)
         if event.direction == Gdk.ScrollDirection.DOWN:
             self.vm_glcore.mouse_scroll(-1)
     
+    def _mouse_scroll_smooth(self, event):
+        """ [EN] 2026-09-28 (macOS report): trackpad SMOOTH scroll ->
+            the same discrete steps as the mouse wheel. Fractional vertical
+            movement is accumulated until a whole step is reached (so slow
+            and fast swipes both work and nothing is lost); horizontal,
+            invalid, non-finite and zero deltas are ignored. GDK positive
+            delta_y (fingers moving up / content down) maps to the core's
+            "down" (-1), matching Gdk.ScrollDirection.DOWN on a wheel.
+
+            Ctrl/Shift are taken from event.state for THIS event only (the
+            core's ctrl/shift flags are otherwise driven by key handlers
+            that only exist for the LEFT keys) and restored afterwards, so
+            e.g. Control_R can never leave the flag stuck on. Changing the
+            modifier combination mid-gesture resets the remainder, so a
+            leftover fraction never leaks into a different action.
+        """
+        try:
+            valid, delta_x, delta_y = event.get_scroll_deltas()
+        except (TypeError, ValueError):
+            return
+        if not valid or delta_y is None or not np.isfinite(delta_y) or delta_y == 0:
+            return
+
+        state = event.state
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        if (ctrl, shift) != self._scroll_modifiers:
+            self._scroll_modifiers = (ctrl, shift)
+            self._scroll_remainder = 0.0
+
+        total = self._scroll_remainder - delta_y
+        steps = int(total)                  # truncates toward zero
+        self._scroll_remainder = total - steps
+        if steps == 0:
+            return
+
+        saved_ctrl, saved_shift = self.vm_glcore.ctrl, self.vm_glcore.shift
+        self.vm_glcore.ctrl, self.vm_glcore.shift = ctrl, shift
+        try:
+            direction = 1 if steps > 0 else -1
+            for _ in range(abs(steps)):
+                self.vm_glcore.mouse_scroll(direction)
+        finally:
+            self.vm_glcore.ctrl, self.vm_glcore.shift = saved_ctrl, saved_shift
+
     def _build_glmenu(self, bg_menu=None, sele_menu=None, obj_menu=None, pick_menu=None):
         """ Function doc """
         if bg_menu is not None:

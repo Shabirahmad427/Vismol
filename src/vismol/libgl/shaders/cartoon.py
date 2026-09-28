@@ -61,6 +61,24 @@ struct Light {
 };
 
 uniform Light my_light;
+// [EN] 2026-09-26 user request ("alterar a transparencia da representacao
+// de cartoon"): plain alpha uniform, same role as SurfaceRepresentation's
+// own "surf_alpha" -- see CartoonRepresentation.draw_representation() for
+// where this gets set + the matching glBlendFunc/glDepthMask dance.
+uniform float cartoon_alpha;
+
+// [EN] 2026-09-28 user request ("a representacao deve ser sensivel ao
+// fog... melhora muito a nocao de profundidade"): same linear depth-fog
+// uniforms every other lit shader in this package already declares (see
+// shaders/sticks.py) -- VismolGLCore.load_fog() was ALREADY being called
+// for this program by CartoonRepresentation.draw_representation(), but
+// silently did nothing (_uniform_changed() skips a uniform the program
+// doesn't declare), so the ribbon was the one thing on screen that
+// ignored the fog.
+uniform vec4 fog_color;
+uniform float fog_start;
+uniform float fog_end;
+uniform float fog_intensity;
 
 in vec3 frag_coord;
 in vec3 frag_color;
@@ -102,6 +120,65 @@ void main () {
     vec3 specular = specular_coef * my_light.intensity;
     specular = specular * (vec3(1.0) - diffuse);
 
-    final_color = vec4(ambient + diffuse + specular, 1.0);
+    vec3 lit_color = ambient + diffuse + specular;
+
+    // [EN] frag_coord is already in view space (see v_shader_triangles),
+    // so |z| is the eye distance -- same formula as shaders/sticks.py,
+    // except the factor is clamped to [0,1] (beyond fog_end the unclamped
+    // mix() would extrapolate PAST the fog colour). Only RGB is fogged;
+    // alpha stays cartoon_alpha so transparency is unaffected.
+    float dist = abs(frag_coord.z);
+    if (dist >= fog_start) {
+        float fog_factor = 1.0 - fog_intensity * (1.0 - clamp((fog_end - dist) / (fog_end - fog_start), 0.0, 1.0));
+        lit_color = mix(fog_color.rgb, lit_color, fog_factor);
+    }
+
+    final_color = vec4(lit_color, cartoon_alpha);
+}
+"""
+
+# [EN] 2026-09-26 user request ("tornar a representacao clicavel... plot o
+# c-alpha trace como referencia para encontrar os residuos"): a REAL
+# picking shader for Cartoon -- the "cartoon_sel" program used to be
+# compiled from the SAME v_shader_triangles/f_shader_triangles pair as the
+# visible pass (see _compile_shader_cartoon() in vismol_glcore.py before
+# this fix), which is wrong for picking: that fragment shader applies real
+# lighting, so the picking-ID colours it would output are NOT the exact
+# byte-for-byte IDs _pick() decodes (GL.glReadPixels + r+g*256+b*256*256).
+# This pair is flat/unlit -- outputs vert_color completely unchanged, same
+# convention as every other representation's own "_sel" shader (compare
+# shaders/lines.py's sel_vertex_shader_lines/sel_fragment_shader_lines).
+# Draws CartoonRepresentation's own separate Ca-trace pick geometry (see
+# _build_pick_trace_geometry() in representations.py), NOT the visible
+# ribbon mesh -- a ribbon has no 1:1 vertex-to-atom correspondence to give
+# real per-vertex pick colours to, but its OWN backbone Ca trace does.
+sel_vertex_shader_cartoon = """
+#version 330
+
+layout(std140) uniform CameraMatrices {
+    mat4 view_mat;
+    mat4 proj_mat;
+};
+uniform mat4 model_mat;
+
+in vec3 vert_coord;
+in vec3 vert_color;
+
+out vec3 frag_color;
+
+void main () {
+    frag_color = vert_color;
+    gl_Position = proj_mat * view_mat * model_mat * vec4(vert_coord, 1.0);
+}
+"""
+
+sel_fragment_shader_cartoon = """
+#version 330
+
+in vec3 frag_color;
+out vec4 final_color;
+
+void main () {
+    final_color = vec4(frag_color, 1.0);
 }
 """

@@ -153,7 +153,12 @@ class VismolGLCore:
                                  self.width / self.height,
                                  np.array([0,0,10], dtype=np.float32),
                                  self.zero_reference_point)
-        
+        # [EN] 2026-09-26 user request ("um parametro para a extensao do
+        # fog") -- see GLCamera.fog_range_scale's own docstring.
+        # 2026-09-28: plus the Preferences > General > Fog settings
+        # (enable/intensity/custom start-end), see GLCamera.apply_fog_parameters().
+        self.glcamera.apply_fog_parameters(self.vm_config.gl_parameters)
+
         # Font family/size for the labels drawn in the glArea can be
         # customized by the user in the Preferences window ("Labels Font
         # (glArea)"). 'label_font_file'/'label_font_size' drive the
@@ -195,6 +200,11 @@ class VismolGLCore:
         self.parent_widget.set_has_depth_buffer(True)
         self.parent_widget.set_has_alpha(True)
         self.scroll = self.vm_config.gl_parameters["scroll_step"]
+        # per-tick exponential rate applied to the current slab WIDTH
+        # (z_far - z_near) -- see mouse_scroll(); kept separate from
+        # self.scroll, which Ctrl+scroll still uses unchanged for its own
+        # fixed-step model-matrix translation.
+        self.scroll_step_fraction = self.vm_config.gl_parameters.get("scroll_step_fraction", 0.138)
         self.bckgrnd_color = self.vm_config.gl_parameters["background_color"]
         #                       Light Parameters                                
         self.light_position = self.vm_config.gl_parameters["light_position"]
@@ -250,9 +260,16 @@ class VismolGLCore:
         if not hasattr(self, "glcamera"):
             return
         self.glcamera.viewport_aspect_ratio = self.width / self.height
+        # [EN] 2026-09-28 BUG FIX (macOS report, not macOS-specific): the
+        # slab/clipping zoom deliberately lets the STORED z_near go below
+        # zero (it keeps tracking the slab), and every other place that
+        # builds the projection clamps it with max(z_near, min_znear) --
+        # this one didn't, so a resize after widening the clipping built
+        # an invalid perspective matrix (near <= 0).
         _proj_mat = mop.my_glPerspectivef(self.glcamera.field_of_view,
                                           self.glcamera.viewport_aspect_ratio,
-                                          self.glcamera.z_near, self.glcamera.z_far)
+                                          max(self.glcamera.z_near, self.glcamera.min_znear),
+                                          self.glcamera.z_far)
         self.glcamera.set_projection_matrix(_proj_mat)
 
     def _macos_modes_from_buttons(self, left, middle, right):
@@ -1030,23 +1047,74 @@ class VismolGLCore:
                     
                     
         else:
-            pos_z = self.glcamera.get_position()[2]
+            # [EN] 2026-09-25 slab-zoom fix (user's own report: the plain
+            # scroll wheel widened/narrowed z_near/z_far by a FIXED constant
+            # (self.scroll) per tick, so a step near the min_znear floor felt
+            # exactly as coarse as one taken from a wide-open slab; user
+            # wants finer increments specifically as z_near/z_far get close
+            # together, and suggested a quadratic or exponential model).
+            # Went through 2 iterations before this one, both self-caught by
+            # a live repeated-tick test before shipping:
+            #   1. Step proportional to the slab-MIDPOINT distance (the
+            #      formula _zoom_view() already uses for its own right-drag
+            #      dolly) -- wrong reference: that distance stays constant
+            #      here, since every plain tick narrows/widens symmetrically
+            #      about a fixed centre, so the step never actually shrank.
+            #   2. Step = slab WIDTH (z_far - z_near) * a fixed fraction,
+            #      i.e. w -> w*(1 +/- 2*fraction) per tick -- shrinks/grows
+            #      as wanted, but is only an approximately-exponential
+            #      progression: since (1+2f) and (1-2f) are not exact
+            #      multiplicative inverses of each other, N ticks up
+            #      followed by N ticks down does NOT return to the original
+            #      width (a real, measured net drift over repeated ticks).
+            # Fixed by using a genuinely exponential (multiplicative) model:
+            # width *= exp(+RATE) on the way out, width *= exp(-RATE) on the
+            # way in. exp(RATE) and exp(-RATE) are EXACT reciprocals of each
+            # other at every scale, so this is perfectly reversible (equal
+            # up/down ticks always return to the exact starting width, not
+            # just approximately) while still giving finer absolute
+            # increments the narrower the slab already is and coarser ones
+            # the wider it is -- exactly the model the user asked for.
+            # `max(..., floor)` only keeps the width used for this
+            # calculation from being exactly zero/negative; the existing
+            # crossing-guard below (`z_near + step + 0.005`) is what
+            # actually stops further narrowing once the slab gets very thin.
+            # scroll_step_fraction (a per-tick exponential RATE, not a plain
+            # fraction) defaults to 0.138 -- half the per-tick step of the
+            # original 0.26 default (user's own follow-up: "podemos deixar o
+            # passo mais fino, talvez metade do atual" -- 0.138 is the exact
+            # rate solving exp(rate)-1 = (exp(0.26)-1)/2, not a rough guess).
+            slab_width = max ( self.glcamera.z_far - self.glcamera.z_near, 0.05 )
+            rate = self.scroll_step_fraction
             if up:
-                self.glcamera.z_near -= self.scroll
-                self.glcamera.z_far += self.scroll
+                new_width = slab_width * np.exp ( rate )
+                step = ( new_width - slab_width ) / 2.0
+                self.glcamera.z_near -= step
+                self.glcamera.z_far += step
             if down:
-                if (self.glcamera.z_far-self.scroll) >= (self.glcamera.min_zfar):
-                    if (self.glcamera.z_far-self.scroll) > (self.glcamera.z_near + self.scroll + 0.005):
-                        self.glcamera.z_near += self.scroll
-                        self.glcamera.z_far -= self.scroll
-            
+                new_width = slab_width * np.exp ( -rate )
+                step = ( slab_width - new_width ) / 2.0
+                if (self.glcamera.z_far-step) >= (self.glcamera.min_zfar):
+                    if (self.glcamera.z_far-step) > (self.glcamera.z_near + step + 0.005):
+                        self.glcamera.z_near += step
+                        self.glcamera.z_far -= step
+
             if (self.glcamera.z_near >= self.glcamera.min_znear):
                 self.glcamera.set_projection_matrix(mop.my_glPerspectivef(self.glcamera.field_of_view,
                         self.glcamera.viewport_aspect_ratio, self.glcamera.z_near, self.glcamera.z_far))
             else:
                 if self.glcamera.z_far < (self.glcamera.min_zfar + self.glcamera.min_znear):
-                    self.glcamera.z_near -= self.scroll
-                    self.glcamera.z_far = self.glcamera.min_clip + self.glcamera.min_znear
+                    self.glcamera.z_near -= step
+                    # [EN] 2026-09-25 bug fix: was `self.glcamera.min_clip`,
+                    # an attribute that does not exist anywhere on GLCamera
+                    # (only min_znear/min_zfar do) -- would raise
+                    # AttributeError the first time this recovery branch was
+                    # ever reached. The floor being tested two lines above
+                    # (`min_zfar + min_znear`) is clearly the intended
+                    # recovery value for z_far here, matching the same
+                    # "if below floor: snap to floor" idiom used elsewhere
+                    # in this function (e.g. the `down` branch above).
+                    self.glcamera.z_far = self.glcamera.min_zfar + self.glcamera.min_znear
                 self.glcamera.set_projection_matrix(mop.my_glPerspectivef(self.glcamera.field_of_view,
                                                     self.glcamera.viewport_aspect_ratio,
                                                     self.glcamera.min_znear, self.glcamera.z_far))
@@ -1813,10 +1881,13 @@ class VismolGLCore:
             self.right  = self.width / self.height
             self.left   = -self.right
             self.glcamera.viewport_aspect_ratio = self.width / self.height
+            # same effective-near clamp as resize_window() (the stored
+            # z_near can be negative after widening the clipping slab)
             self.glcamera.set_projection_matrix(
                 mop.my_glPerspectivef(self.glcamera.field_of_view,
                                       self.glcamera.viewport_aspect_ratio,
-                                      self.glcamera.z_near, self.glcamera.z_far))
+                                      max(self.glcamera.z_near, self.glcamera.min_znear),
+                                      self.glcamera.z_far))
 
             GL.glViewport(0, 0, new_width, new_height)
             self.render()
@@ -2472,6 +2543,13 @@ class VismolGLCore:
         loc, changed = self._uniform_changed(program, "fog_color", val)
         if changed:
             GL.glUniform4fv(loc, 1, self.bckgrnd_color)
+        # 2026-09-28 (Preferences > General > Fog): 0 = no fog, 1 = the
+        # original full-strength fog. Every shader that has fog declares
+        # it; programs that don't simply get loc == -1 and skip it.
+        intensity = self.glcamera.get_effective_fog_intensity()
+        loc, changed = self._uniform_changed(program, "fog_intensity", intensity)
+        if changed:
+            GL.glUniform1f(loc, intensity)
 
     def load_fog_legacy(self, program):
         """ Load the fog parameters in the specified program
@@ -3034,8 +3112,14 @@ class VismolGLCore:
         """ Function doc """
         self.shader_programs["cartoon"] = self.load_shaders(shaders_cartoon.v_shader_triangles,
                                                     shaders_cartoon.f_shader_triangles)
-        self.shader_programs["cartoon_sel"] = self.load_shaders(shaders_cartoon.v_shader_triangles,
-                                                    shaders_cartoon.f_shader_triangles)
+        # [EN] 2026-09-26 fix: this used to compile "cartoon_sel" from the
+        # SAME lit shader pair as the visible mesh above -- wrong for
+        # picking (see shaders/cartoon.py's own sel_vertex_shader_cartoon/
+        # sel_fragment_shader_cartoon docstring for why). Now a real flat/
+        # unlit shader, matching every other representation's own "_sel"
+        # convention (e.g. _compile_shader_lines() just below).
+        self.shader_programs["cartoon_sel"] = self.load_shaders(shaders_cartoon.sel_vertex_shader_cartoon,
+                                                    shaders_cartoon.sel_fragment_shader_cartoon)
     
     '''
     #----------------------------NOT IMPLEMENTED YET---------------------------#

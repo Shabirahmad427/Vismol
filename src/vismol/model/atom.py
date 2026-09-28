@@ -114,6 +114,10 @@ class Atom:
         self.vdw_spheres    = False
         self.dash           = False
         self.surface        = False
+        # [EN] 2026-09-28 partial cartoon: residue is drawn by the Cartoon
+        # representation when its CA atom has this set -- see
+        # CartoonRepresentation._residue_is_shown() (representations.py).
+        self.cartoon        = False
         self.bonds          = []
         self.isfree         = True
         self.labels         = False

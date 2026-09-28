@@ -70,6 +70,22 @@ class VismolConfig:
                               "mouse_rotation_sensibility" : 1.5,
 
                               "scroll_step": 0.9,
+                              # per-tick exponential rate applied to the
+                              # current slab WIDTH (z_far - z_near) -- a
+                              # genuinely exponential (multiplicatively
+                              # reversible) step, not a fixed one -- see
+                              # VismolGLCore.mouse_scroll(); 0.138 gives half
+                              # the per-tick step of an initial 0.26 default
+                              # (user's own follow-up request for a finer
+                              # scroll).
+                              "scroll_step_fraction": 0.138,
+                              # Fog settings -- see GLCamera.apply_fog_parameters().
+                              "fog_enabled": True,
+                              "fog_intensity": 100.0,
+                              "fog_range_scale": 1.0,
+                              "fog_custom_range": False,
+                              "fog_start_percent": 50.0,
+                              "fog_end_percent": 100.0,
                               "field_of_view": 10,
                               "light_position": [0, 0, 10.0],
                               #"light_position": [-2.5, 2.5, 3.0],
@@ -140,7 +156,12 @@ class VismolConfig:
                               "cartoon_coil_radius"        : 0.32,
                               "cartoon_helix_tolerance"    : 100.0,
                               "cartoon_strand_tolerance"   : 150.0,
-                              "cartoon_min_run"            : 2,
+                              "cartoon_min_run_helix"      : 3,
+                              "cartoon_min_run_strand"     : 2,
+                              "cartoon_transparency"       : 0,
+                              "cartoon_arrow_taper_residues" : 2,
+                              "cartoon_strand_smoothing"      : 4,
+                              "cartoon_spline_detail"        : 5,
                               "cartoon_dynamic_secondary_structure" : False,
                               "surface_type"                : "ses",
                               "surface_probe_radius"        : 1.4,

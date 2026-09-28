@@ -1002,9 +1002,13 @@ class SticksRepresentation(Representation):
     # removido: o picking/selecao nao precisa mais de nenhum buffer de ordem
     # de ligacao. A ordem agora e lida no geometry shader via
     # u_bond_order_tbo (Buffer Texture) + gl_PrimitiveIDIn; o programa de
-    # selecao (sticks_sel) usa o MESMO geometry shader mas nunca vincula essa
-    # textura, entao texelFetch retorna 0 -> clamp para ordem 1 (ligacao
-    # simples) -> raio cheio, sem offset. Isso e exatamente o comportamento
+    # selecao (sticks_sel) usa a variante sel_geometry_shader_sticks (mesmo
+    # geometry shader compilado com PICKING_PASS), que nao declara essa
+    # textura e fixa ordem 1 (ligacao simples) -> raio cheio, sem offset.
+    # (Antes o sel usava o MESMO shader sem vincular a textura, supondo que
+    # texelFetch retornaria 0 -- falso no core profile: um sampler nao
+    # vinculado le a textura da unidade 0; no macOS isso gerava o aviso de
+    # textura de inteiro sem sinal no picking.) Isso e exatamente o comportamento
     # ja documentado em draw_background_sel_representation ("Independe de
     # bond_order"), entao a classe base (sem bond-order) ja e suficiente.
 
@@ -2068,7 +2072,20 @@ def _cartoon_settings_from_gl_parameters ( gl_parameters ):
         'color_coil':   tuple ( gl_parameters.get ( 'cartoon_color_coil',   d['color_coil'] ) ),
         'helix_tolerance_scale':  gl_parameters.get ( 'cartoon_helix_tolerance',  d['helix_tolerance_scale']  * 100.0 ) / 100.0,
         'strand_tolerance_scale': gl_parameters.get ( 'cartoon_strand_tolerance', d['strand_tolerance_scale'] * 100.0 ) / 100.0,
-        'min_run': int ( gl_parameters.get ( 'cartoon_min_run', d['min_run'] ) ),
+        # [EN] 2026-09-26 user request ("um parametro minimo de residuos
+        # para ser considerado uma fita e uma helice... faz sentido um
+        # unico residuo?") -- replaced the single shared 'min_run' with
+        # per-SS-type minimums; see ribbon_backbone.py's own
+        # _smooth_short_runs() docstring for why the defaults differ.
+        'min_run_helix':  int ( gl_parameters.get ( 'cartoon_min_run_helix',  d['min_run_helix']  ) ),
+        'min_run_strand': int ( gl_parameters.get ( 'cartoon_min_run_strand', d['min_run_strand'] ) ),
+        # [EN] 2026-09-26 aesthetic fix -- see ribbon_geometry.py's own
+        # DEFAULT_CARTOON_SETTINGS comment for the full "shark fin" story.
+        'arrow_taper_residues': int ( gl_parameters.get ( 'cartoon_arrow_taper_residues', d['arrow_taper_residues'] ) ),
+        # [EN] 2026-09-26 aesthetic fix ("sinuosa" strand centerline vs a
+        # PyMOL-style straighter "flecha") -- see ribbon_geometry.py's own
+        # _smooth_strand_guide_points() docstring.
+        'strand_smoothing_iterations': int ( gl_parameters.get ( 'cartoon_strand_smoothing', d['strand_smoothing_iterations'] ) ),
     }
 
 
@@ -2105,7 +2122,7 @@ class CartoonRepresentation(Representation):
     why a full rebuild, not a cheap coordinate-only update, is what a new
     frame actually needs here. """
 
-    def __init__ ( self, vismol_object, vismol_glcore, name = 'cartoon', active = True ):
+    def __init__ ( self, vismol_object, vismol_glcore, name = 'cartoon', active = True, show_all = True ):
         self.name       = name
         self.active     = active
         self.vm_object  = vismol_object
@@ -2146,6 +2163,18 @@ class CartoonRepresentation(Representation):
         self.shader_program     = None
         self.sel_shader_program = None
 
+        # [EN] 2026-09-26 user request ("alterar a transparencia da
+        # representacao de cartoon") -- same role/name/range as
+        # SurfaceRepresentation's own self.alpha/set_alpha() just above in
+        # this file; see draw_representation()'s own blend/depth-mask
+        # handling below for how this is actually applied. Read from
+        # gl_parameters at construction time (like every other cartoon_*
+        # style setting) so a NEW cartoon rep created after the user has
+        # already set a transparency preference starts with it applied,
+        # not fully opaque until the next Preferences Apply.
+        _gp_alpha = getattr ( vismol_object.vm_session.vm_config, 'gl_parameters', {} )
+        self.alpha = 1.0 - float ( _gp_alpha.get ( 'cartoon_transparency', 0 ) ) / 100.0
+
         # [EN] User request (round 8 -- "Preferences: cartoon dinamico ou
         # nao, por padrao nao"): per-chain H/S/C classification cache, see
         # rebuild()'s own docstring below for the full story. None here
@@ -2153,11 +2182,96 @@ class CartoonRepresentation(Representation):
         # always classifies fresh, same as before this cache existed.
         self._cached_ss_codes = None
 
+        # [EN] 2026-09-26 user request ("tornar a representacao clicavel...
+        # plot o c-alpha trace como referencia") -- separate picking-only
+        # geometry (a thick Ca-Ca line trace, coloured by each residue's
+        # own real picking-ID colour), built alongside the visible mesh
+        # below and again on every rebuild(); see
+        # _build_pick_trace_geometry()'s own docstring for the full story.
+        self.pick_coords = None
+        self.pick_colors = None
+
+        # [EN] 2026-09-28 user request ("o usuario pode escolher o padrao
+        # de cores para o cartoon (cada representacao pode ter um padrao
+        # diferente)... colorir tipo rainbow"): the colour scheme belongs
+        # to THIS representation instance, not to gl_parameters -- see
+        # set_color_mode() and ribbon_geometry.residue_colors_for_records()
+        # for the available modes. The SS colours themselves ("ss" mode)
+        # still come from Preferences > Cartoon, shared by everyone.
+        self.color_mode    = 'ss'
+        self.uniform_color = ( 0.85, 0.85, 0.85 )
+
+        # [EN] 2026-09-28 user request ("representar apenas parte da
+        # estrutura na forma de cartoon, uma vez selecionada e atribuida
+        # pelo usuario"): which residues get drawn is the per-atom
+        # atom.cartoon flag on each residue's Ca (same per-atom-flag
+        # convention as atom.sticks/atom.lines, driven by vm_session.
+        # show_or_hide(rep_type='cartoon', ...)). show_all=True (the
+        # treeview "Representation > Cartoon" toggle) means "the whole
+        # object" -- every atom gets flagged here; show_or_hide() creates
+        # the representation with show_all=False instead, AFTER flagging
+        # only the selected atoms itself.
+        if show_all:
+            self.set_all_residues_shown ( True, rebuild = False )
+
+        self._build_mesh ( cached_ss_codes = None )
+
+    def _residue_is_shown ( self, ca_atom ):
+        return bool ( getattr ( ca_atom, 'cartoon', False ) )
+
+    def has_shown_residues ( self ):
+        """ True if at least one Ca atom of this object is flagged for
+        the cartoon (i.e. there is something to draw). """
+        for atom in self.vm_object.atoms.values ( ):
+            if atom.name == 'CA' and getattr ( atom, 'cartoon', False ):
+                return True
+        return False
+
+    def set_all_residues_shown ( self, show = True, rebuild = True ):
+        """ Flags (or clears) every atom of the object -- the "whole
+        object" cartoon used by the treeview's Representation menu. """
+        for atom in self.vm_object.atoms.values ( ):
+            atom.cartoon = bool ( show )
+        if rebuild:
+            self.rebuild ( )
+
+    def set_color_mode ( self, color_mode, uniform_color = None ):
+        """ Per-representation colour scheme: 'ss' (secondary structure,
+        Preferences colours), 'rainbow' (N->C blue->red per chain),
+        'chain', 'atom' (each residue's Ca atom colour) or 'uniform'
+        (`uniform_color`, RGB 0-1). Rebuilds the mesh -- the colour is
+        baked into the vertex buffer, like everything else here -- but
+        reuses the cached SS classification (colour never changes it). """
+        from vismol.utils.ribbon_geometry import CARTOON_COLOR_MODES
+        if color_mode not in CARTOON_COLOR_MODES:
+            raise ValueError ( "unknown cartoon color mode: {}".format ( color_mode ) )
+        self.color_mode = color_mode
+        if uniform_color is not None:
+            self.uniform_color = tuple ( float ( c ) for c in list ( uniform_color )[:3] )
+        self.rebuild ( )
+
+    def _build_mesh ( self, cached_ss_codes = None ):
+        """ Shared by __init__ and rebuild(): runs build_ribbon_mesh_
+        for_object() with the current gl_parameters settings + this
+        representation's own colour scheme and shown-residue filter, and
+        stores the resulting buffers (plus the pick trace). """
         from vismol.utils.ribbon_geometry import build_ribbon_mesh_for_object
         gl_parameters = getattr ( self.vm_session.vm_config, 'gl_parameters', {} )
         settings = _cartoon_settings_from_gl_parameters ( gl_parameters )
+        # [EN] 2026-09-26: user-tunable via Preferences > Cartoon ("Ribbon
+        # Detail"); default 5 UNCHANGED from before, since a higher value
+        # visibly smooths out the ribbon (confirmed live, spline_detail=12
+        # on a real protein) but roughly triples full-protein mesh-build
+        # cost -- exactly the cost round 9 just finished cutting down for
+        # large structures (6VXX-scale). Left low by default so that fix
+        # isn't silently undone; a small/medium protein can afford to turn
+        # this up for a noticeably smoother look.
+        spline_detail = int ( gl_parameters.get ( 'cartoon_spline_detail', 5 ) )
         coords, normals, colors, indexes, ss_codes_per_chain = build_ribbon_mesh_for_object (
-            vismol_object, spline_detail = 5, settings = settings, return_ss_codes = True )
+            self.vm_object, spline_detail = spline_detail, settings = settings,
+            cached_ss_codes = cached_ss_codes, return_ss_codes = True,
+            color_mode = self.color_mode, uniform_color = self.uniform_color,
+            ca_filter = self._residue_is_shown )
         self._cached_ss_codes = ss_codes_per_chain
 
         self.coords  = np.ascontiguousarray ( coords,  dtype = np.float32 )
@@ -2165,6 +2279,57 @@ class CartoonRepresentation(Representation):
         self.normals = np.ascontiguousarray ( normals, dtype = np.float32 )
         self.indexes = np.ascontiguousarray ( indexes, dtype = np.uint32 )
         self.elements = np.uint32 ( self.indexes.shape[0] )
+
+        # [EN] 2026-09-26: real atom positions may have moved (trajectory/
+        # MD frame change) -- the pick trace must track the SAME current
+        # frame the visible mesh above was just rebuilt from.
+        self.pick_coords, self.pick_colors = self._build_pick_trace_geometry ( )
+
+    def _build_pick_trace_geometry ( self ):
+        """ [EN] 2026-09-26 user request: "vamos tornar a represetacao
+        clicavel para a ferramenta de selecao / centralizacao, minha
+        sugestao e que no background a gente plot o c-alpha trace como
+        referencia para encontrar os residuos." Exactly this: the ribbon
+        mesh itself has no 1:1 vertex-to-atom correspondence (it's a
+        spline-extruded surface, nowhere near the same vertex count/order
+        as vm_object's own atoms), so it can't get real per-vertex picking
+        colours the way Lines/Sticks/Spheres do -- but the backbone Ca
+        trace, ONE point per residue, genuinely does. Builds a plain list
+        of Ca-Ca line SEGMENTS (GL_LINES topology, no index buffer needed
+        -- see draw_background_sel_representation()'s glDrawArrays call),
+        one segment per consecutive residue pair within each contiguous
+        chain record (extract_backbone_chains() already refuses to bridge
+        a chain change or a real sequence gap -- reused as-is here, so the
+        pick trace never draws a segment where the ribbon itself has none
+        either). BOTH endpoints of a given segment get the SAME colour
+        (that segment's own first residue's real atom.color_id, the exact
+        per-atom picking-ID encoding _pick() already knows how to decode
+        via vm_session.atom_dic_id -- see Atom._generate_atom_unique_
+        color_id()) -- deliberately, so there is no colour INTERPOLATION
+        across a segment's length to corrupt the ID (a blended colour
+        would decode to a bogus, nonexistent ID). Uses the RAW (un-
+        smoothed) Ca positions, not round 11's smoothed spline centerline
+        -- this is a real atom's real position, not a rendering guide. """
+        from vismol.utils.ribbon_backbone import extract_backbone_chains
+        records = extract_backbone_chains ( self.vm_object )
+        coords = [ ]
+        colors = [ ]
+        for record in records:
+            ca = record["ca"]
+            ca_atoms = record["ca_atoms"]
+            for i in range ( len ( ca ) - 1 ):
+                # [EN] 2026-09-28 partial cartoon: only where the ribbon
+                # itself is drawn (both ends of the segment shown).
+                if not ( self._residue_is_shown ( ca_atoms[i] ) and self._residue_is_shown ( ca_atoms[i + 1] ) ):
+                    continue
+                color = ca_atoms[i].color_id
+                coords.append ( ca[i] );     colors.append ( color )
+                coords.append ( ca[i + 1] ); colors.append ( color )
+        if not coords:
+            return ( np.zeros ( ( 0, 3 ), dtype = np.float32 ),
+                      np.zeros ( ( 0, 3 ), dtype = np.float32 ) )
+        return ( np.ascontiguousarray ( coords, dtype = np.float32 ),
+                  np.ascontiguousarray ( colors, dtype = np.float32 ) )
 
     def rebuild ( self, force_reclassify = False ):
         """ [EN] Re-runs the mesh build (current gl_parameters settings,
@@ -2207,23 +2372,17 @@ class CartoonRepresentation(Representation):
         behaviour. Either way the cache is refreshed with whatever was
         actually used this call, so toggling the setting later picks up
         cleanly from wherever playback currently is. """
-        from vismol.utils.ribbon_geometry import build_ribbon_mesh_for_object
         gl_parameters = getattr ( self.vm_session.vm_config, 'gl_parameters', {} )
-        settings = _cartoon_settings_from_gl_parameters ( gl_parameters )
         dynamic_ss = bool ( gl_parameters.get ( 'cartoon_dynamic_secondary_structure', False ) )
         cached = None if ( force_reclassify or dynamic_ss ) else self._cached_ss_codes
-        coords, normals, colors, indexes, ss_codes_per_chain = build_ribbon_mesh_for_object (
-            self.vm_object, spline_detail = 5, settings = settings,
-            cached_ss_codes = cached, return_ss_codes = True )
-        self._cached_ss_codes = ss_codes_per_chain
-
-        self.coords  = np.ascontiguousarray ( coords,  dtype = np.float32 )
-        self.colors  = np.ascontiguousarray ( colors,  dtype = np.float32 )
-        self.normals = np.ascontiguousarray ( normals, dtype = np.float32 )
-        self.indexes = np.ascontiguousarray ( indexes, dtype = np.uint32 )
-        self.elements = np.uint32 ( self.indexes.shape[0] )
+        self._build_mesh ( cached_ss_codes = cached )
         self.vao     = None
         self.sel_vao = None
+
+    def set_alpha ( self, alpha ):
+        """ alpha: 0.0 (totalmente transparente) a 1.0 (opaco) -- same
+        contract as SurfaceRepresentation.set_alpha(). """
+        self.alpha = max ( 0.0, min ( 1.0, float ( alpha ) ) )
 
     def _make_gl_representation_vao_and_vbos ( self, debug = False ):
         """ [EN] Overrides the base Representation version (which reads
@@ -2258,20 +2417,18 @@ class CartoonRepresentation(Representation):
         return norm_vbo
 
     def _make_gl_sel_representation_vao_and_vbos ( self, debug = False ):
-        """ [EN] Background/picking VAO -- reuses the exact same geometry
-        and colours as the main representation (NOT real per-vertex pick
-        colours, which would need one unique colour per pickable unit;
-        out of scope -- click-to-select on a Cartoon ribbon isn't
-        implemented, same as the representation this replaces). Exists
-        purely so _check_vao_and_vbos() (which unconditionally builds
-        both the main AND the sel VAO the first time a representation is
-        drawn) has something valid to build. """
+        """ [EN] 2026-09-26: background/picking VAO for the Ca-trace built
+        by _build_pick_trace_geometry() -- NOT the visible ribbon mesh
+        (self.coords/self.indexes), which has no 1:1 vertex-to-atom
+        correspondence to give real per-vertex pick colours to. No index
+        buffer: draw_background_sel_representation() below uses
+        glDrawArrays(GL_LINES, ...) directly over pick_coords, which is
+        already laid out as consecutive (start, end) pairs. """
         if debug:
             logger.debug ( "building '{}' background selection VAO and VBOs".format ( self.name ) )
         self.sel_vao       = self._make_gl_vao ( )
-        self.sel_ind_vbo   = self._make_gl_index_buffer ( self.indexes )
-        self.sel_coord_vbo = self._make_gl_coord_buffer ( self.coords, self.sel_shader_program )
-        self.sel_col_vbo   = self._make_gl_color_buffer ( self.colors, self.sel_shader_program )
+        self.sel_coord_vbo = self._make_gl_coord_buffer ( self.pick_coords, self.sel_shader_program )
+        self.sel_col_vbo   = self._make_gl_color_buffer ( self.pick_colors, self.sel_shader_program )
 
     def draw_representation ( self ):
         # [EN] User request: "extender a representacao para todos os
@@ -2317,13 +2474,66 @@ class CartoonRepresentation(Representation):
         self.vm_glcore.load_lights   ( self.shader_program )
         self.vm_glcore.load_fog      ( self.shader_program )
 
+        # [EN] 2026-09-26 user request ("alterar a transparencia da
+        # representacao de cartoon") -- same glBlendFunc/glDepthMask
+        # dance as SurfaceRepresentation.draw_representation() above:
+        # depth TEST stays on (so an opaque object in front still hides
+        # this ribbon), but depth WRITES are switched off while
+        # translucent so the ribbon's own far/near walls don't self-
+        # occlude in a way that looks wrong through the transparency.
+        alpha_loc = GL.glGetUniformLocation ( self.shader_program, "cartoon_alpha" )
+        GL.glUniform1f ( alpha_loc, self.alpha )
+        if self.alpha < 1.0:
+            GL.glBlendFunc ( GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA )
+            GL.glEnable ( GL.GL_BLEND )
+            GL.glDepthMask ( GL.GL_FALSE )
+
         GL.glBindVertexArray ( self.vao )
         GL.glDrawElements ( GL.GL_TRIANGLES, int ( len ( self.indexes ) ), GL.GL_UNSIGNED_INT, None )
+
+        if self.alpha < 1.0:
+            GL.glDepthMask ( GL.GL_TRUE )
+            GL.glDisable ( GL.GL_BLEND )
         GL.glDisable ( GL.GL_DEPTH_TEST )
 
     def draw_background_sel_representation ( self ):
-        """ Function doc """
-        pass
+        """ [EN] 2026-09-26 user request ("tornar a representacao clicavel
+        para a ferramenta de selecao/centralizacao") -- draws the Ca-trace
+        built by _build_pick_trace_geometry() into the shared picking
+        framebuffer (see VismolGLCore._pick(), which calls this on every
+        active representation of every active object, then reads back ONE
+        pixel and decodes it via vm_session.atom_dic_id -- fully generic,
+        NOT modified for this: any representation whose sel-pass draws a
+        real atom's colour.color_id at a real 3D position already resolves
+        correctly through that existing code, no changes needed there).
+        Line-based, not point-based, so a click landing ANYWHERE along the
+        ribbon's own length (not just exactly on a Ca) still resolves to
+        the nearest residue -- reuses the same generously-wide
+        'line_width_selection' every other representation's own sel-pass
+        already uses for exactly this "make the click target easier to
+        hit" reason (see e.g. LinesRepresentation.draw_background_sel_
+        representation() above). """
+        if self.pick_coords is None or len ( self.pick_coords ) == 0:
+            return
+        # [EN] 2026-09-28 BUG FIX: the picking pass can run BEFORE this
+        # representation's first draw_representation() (e.g. the Builder's
+        # hover pick, which render() runs ahead of the normal draw loop),
+        # or right after a rebuild() reset sel_vao -- sel_shader_program/
+        # sel_vao were still None there (ctypes "wrong type" crash in
+        # glUseProgram). Same lazy check every other representation's own
+        # sel-pass already starts with.
+        self._check_vao_and_vbos ( )
+        GL.glEnable ( GL.GL_DEPTH_TEST )
+        GL.glUseProgram ( self.sel_shader_program )
+        line_width = self.vm_session.vm_config.gl_parameters.get ( "line_width_selection", 10 )
+        GL.glLineWidth ( line_width )
+        self.vm_glcore.load_matrices ( self.sel_shader_program, self.vm_object.model_mat )
+        GL.glBindVertexArray ( self.sel_vao )
+        GL.glDrawArrays ( GL.GL_LINES, 0, int ( len ( self.pick_coords ) ) )
+        GL.glBindVertexArray ( 0 )
+        GL.glDisable ( GL.GL_DEPTH_TEST )
+        GL.glLineWidth ( 1 )
+        GL.glUseProgram ( 0 )
 
 
 

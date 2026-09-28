@@ -56,6 +56,7 @@ fragment_shader_dot_simple = """
 uniform vec4 fog_color;
 uniform float fog_start;
 uniform float fog_end;
+uniform float fog_intensity;
 
 in vec3 frag_coord;
 in vec3 frag_color;
@@ -64,7 +65,7 @@ out vec4 final_color;
 void main(){
     float dist = abs(frag_coord.z);
     if(dist>=fog_start){
-        float fog_factor = (fog_end-dist)/(fog_end-fog_start);
+        float fog_factor = 1.0 - fog_intensity * (1.0 - clamp((fog_end-dist)/(fog_end-fog_start), 0.0, 1.0));
         final_color = mix(fog_color, vec4(frag_color, 1.0), fog_factor);
     }
     else{
@@ -128,6 +129,7 @@ fragment_shader_dot_circle = """
 uniform vec4 fog_color;
 uniform float fog_start;
 uniform float fog_end;
+uniform float fog_intensity;
 
 in vec3 frag_coord;
 in vec3 frag_color;
@@ -140,7 +142,7 @@ void main(){
     
     dist = abs(frag_coord.z);
     if(dist>=fog_start){
-        float fog_factor = (fog_end-dist)/(fog_end-fog_start);
+        float fog_factor = 1.0 - fog_intensity * (1.0 - clamp((fog_end-dist)/(fog_end-fog_start), 0.0, 1.0));
         final_color = mix(fog_color, vec4(frag_color, 1.0), fog_factor);
     }
     else{
@@ -192,6 +194,7 @@ fragment_shader_dot_disc = """
 uniform vec4 fog_color;
 uniform float fog_start;
 uniform float fog_end;
+uniform float fog_intensity;
 
 in vec3 frag_coord;
 in vec3 frag_color;
@@ -207,7 +210,7 @@ void main(){
     
     dist = abs(frag_coord.z);
     if(dist>=fog_start){
-        float fog_factor = (fog_end-dist)/(fog_end-fog_start);
+        float fog_factor = 1.0 - fog_intensity * (1.0 - clamp((fog_end-dist)/(fog_end-fog_start), 0.0, 1.0));
         final_color = mix(fog_color, circle_color, fog_factor);
     }
     else{
@@ -338,6 +341,7 @@ fragment_shader_posdot_simple = """
 uniform vec4 fog_color;
 uniform float fog_start;
 uniform float fog_end;
+uniform float fog_intensity;
 
 in vec3 frag_coord;
 in vec3 frag_color;

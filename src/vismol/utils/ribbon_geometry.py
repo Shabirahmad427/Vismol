@@ -68,6 +68,27 @@ DEFAULT_CARTOON_SETTINGS = {
     "strand_half_height":    0.18,
     "arrow_half_width":      2.20,   # widest point of the arrowhead base
     "arrow_tip_half_width":  0.04,   # near-zero, but never exactly 0 (degenerate)
+    # [EN] 2026-09-26 aesthetic fix (user report: strand arrowheads looked
+    # like sharp "shark fins" compared to PyMOL/VMD's longer, graceful
+    # triangular taper) -- see _per_residue_half_extents() below. This is
+    # the number of intermediate taper STEPS from the wide arrow base down
+    # to the tip (1 = the old single-segment taper, exactly the previous
+    # behaviour; 2 spreads it over 2 segments instead, roughly doubling the
+    # taper's arc length for a softer point), capped per-run so a short
+    # strand never has its ENTIRE length consumed by the arrowhead.
+    "arrow_taper_residues":  2,
+    # [EN] 2026-09-26 aesthetic fix (user report: strand ribbons looked too
+    # "sinuosa" (wavy/sinuous) -- splining directly through the raw Ca
+    # trace faithfully shows a real beta strand's own physical PLEAT
+    # (Ca positions genuinely alternate slightly above/below the mean
+    # strand plane), but PyMOL/VMD-style cartoons deliberately SMOOTH a
+    # strand's guide points before splining to turn that into a clean,
+    # mostly-straight "arrow" shaft instead -- see
+    # _smooth_strand_guide_points() below. 0 = off (the old, unsmoothed
+    # behaviour); each iteration is one Laplacian-smoothing pass over the
+    # run's own INTERIOR points only (its first/last residues -- the
+    # user's own "onde a fita comeca e termina" -- are always held fixed).
+    "strand_smoothing_iterations": 4,
     "color_helix":  ( 0.90, 0.20, 0.55 ),   # magenta-ish red
     "color_strand": ( 0.95, 0.85, 0.15 ),   # yellow
     "color_coil":   ( 0.85, 0.85, 0.85 ),   # light grey
@@ -76,7 +97,13 @@ DEFAULT_CARTOON_SETTINGS = {
     # ribbon_backbone.py; 1.0 = the published Labesse et al. values.
     "helix_tolerance_scale":  1.0,
     "strand_tolerance_scale": 1.5,
-    "min_run": 2,
+    # [EN] 2026-09-26 user request ("faz sentido um unico residuo estar em
+    # conformacao de fita? o mesmo deve valer para helices") -- split what
+    # used to be one shared `min_run` into per-SS-type minimums; see
+    # ribbon_backbone.py's own _smooth_short_runs() docstring for why 3
+    # and 2 (not equal) are the deliberate, literature-grounded defaults.
+    "min_run_helix":  3,
+    "min_run_strand": 2,
 }
 
 
@@ -272,12 +299,61 @@ def _find_ss_runs ( ss_codes ):
     return runs
 
 
+def _smooth_strand_guide_points ( ca_coords, ss_codes, iterations ):
+    """ [EN] 2026-09-26 (user report): "acho que seria mais interessante
+    que ela tivesse um formato menos sinuosa, em formato de flecha...
+    os carbonos alfa onde a fita comeca e termina sao muito importantes
+    para gerar as fitas em forma de flechas, que as vezes sao torcidas,
+    mas nunca sinuosas." Exactly the distinction every mainstream
+    "PyMOL-style" cartoon renderer (Carson & Bugg 1986 and every
+    descendant) makes: a beta strand's raw Ca trace genuinely zigzags
+    (the real physical pleat of a beta sheet), and splining straight
+    through it -- which is what this module did before this fix, and
+    still does for helix/coil -- faithfully reproduces that zigzag as a
+    visibly wavy ribbon. PyMOL/VMD instead SMOOTH the guide points used
+    for a strand's own centerline before splining, producing a clean,
+    mostly-straight "arrow" shaft. Deliberately position-only: a strand's
+    TWIST comes from _compute_side_vectors(), called on the ORIGINAL
+    (unsmoothed) ca_coords/o_coords -- so an arrow can still end up
+    "torcida" (twisted, real chemistry, left alone) while never being
+    "sinuosa" (a wavy centerline, smoothed away here), matching the
+    user's own distinction exactly.
+
+    Iterative Laplacian smoothing of a strand run's INTERIOR guide points
+    ONLY -- run[0] and run[-1] (the residues "onde a fita comeca e
+    termina") are held perfectly fixed at every iteration, so the ribbon
+    still threads through the true start/end Ca position and connects
+    seamlessly to whatever coil/helix precedes or follows it. Each
+    iteration nudges every interior point toward the average of its two
+    immediate neighbours (a classic, minimal Laplacian smoothing pass) --
+    a few iterations noticeably straighten the strand while a fixed
+    start/end anchor keeps it from ever collapsing onto a dead-straight
+    line (real sheets do have their own gentle large-scale curvature/
+    twist, which this preserves; only the small, residue-to-residue pleat
+    wiggle is removed, since Laplacian smoothing damps high-frequency
+    variation much faster than the strand's own overall trend).
+    `iterations=0` reproduces the OLD unsmoothed behaviour exactly (a
+    plain copy, no-op). """
+    smoothed = np.array ( ca_coords, dtype = np.float64, copy = True )
+    if iterations <= 0:
+        return smoothed
+    runs = _find_ss_runs ( ss_codes )
+    for code, start, end in runs:
+        if code != "S" or ( end - start ) < 2:
+            continue   # < 3 residues -- no interior point to smooth
+        for _ in range ( iterations ):
+            prev_pts = smoothed[start:end - 1]
+            next_pts = smoothed[start + 2:end + 1]
+            interior = smoothed[start + 1:end]
+            smoothed[start + 1:end] = 0.5 * interior + 0.25 * prev_pts + 0.25 * next_pts
+    return smoothed
+
+
 def _per_residue_half_extents ( ss_codes, runs_by_residue, settings ):
     """ Precomputes ONE (half_width, half_height) TARGET per residue --
-    the arrowhead is expressed here too: a strand run's own SECOND-TO-
-    LAST residue is given the arrow's widest BASE extent, and its LAST
-    residue is given a near-zero TIP extent, nothing more special-cased
-    than that.
+    the arrowhead is expressed here too: a strand run's own last
+    `n_taper` residues (see below) ramp smoothly from the arrow's widest
+    BASE extent down to a near-zero TIP extent at the very last residue.
 
     build_ribbon_mesh() below then LINEARLY INTERPOLATES between two
     adjacent residues' targets at every spline point in between (see
@@ -298,7 +374,29 @@ def _per_residue_half_extents ( ss_codes, runs_by_residue, settings ):
     already guaranteed by using _octagon_profile() everywhere -- this
     additional interpolation is what makes the WIDTH itself flare/taper
     smoothly too, rather than merely being topologically connected but
-    still visually abrupt). """
+    still visually abrupt).
+
+    [EN] 2026-09-26 aesthetic fix (user report: "nao estou gostando do
+    resultado estetico das fitas beta" -- compared against PyMOL/VMD).
+    Grounded in a real screenshot of ubiquitin (examples/pdb1ubq.pdb,
+    strand run lengths measured as 5/7/3/3/8 residues): the OLD taper
+    above (widest BASE at the run's second-to-last residue, near-zero TIP
+    at its last) crammed the entire base->tip transition into a SINGLE
+    spline segment (~3.8 A of arc length) -- visually a sharp "shark fin"
+    kink rather than PyMOL/VMD's longer, graceful triangular arrowhead,
+    made worse on short runs (a 3-residue run had 2 of its 3 residues
+    consumed by the arrowhead, leaving almost no flat "body" at all).
+    Fixed by spreading the base->tip ramp over `arrow_taper_residues`
+    SEGMENTS instead of always exactly 1 -- `n_taper` below is that value
+    capped at `max(1, run_length // 2)` so a short run never has more than
+    half its own length consumed by the arrowhead (this cap also means
+    `arrow_taper_residues=2`'s new default reproduces the OLD 1-segment
+    behaviour bit-for-bit on any 2- or 3-residue run, where
+    `run_length // 2` is already 1 -- only strands long enough to afford a
+    longer taper actually get one). The widen-then-narrow "shoulder" where
+    the flat body meets the arrow's wide base is still a single abrupt
+    step, deliberately -- that hard base is a real, visible feature of
+    PyMOL/VMD's own classic arrowhead too, not something to smooth away. """
     n = len ( ss_codes )
     half_widths  = np.zeros ( n, dtype = np.float64 )
     half_heights = np.zeros ( n, dtype = np.float64 )
@@ -309,11 +407,14 @@ def _per_residue_half_extents ( ss_codes, runs_by_residue, settings ):
             half_heights[i] = settings["helix_half_height"]
         elif code == "S":
             run_start, run_end = runs_by_residue[i]
-            if run_end > run_start and i == run_end:
-                half_widths[i]  = settings["arrow_tip_half_width"]
-                half_heights[i] = settings["strand_half_height"]
-            elif run_end > run_start and i == run_end - 1:
-                half_widths[i]  = settings["arrow_half_width"]
+            run_length = run_end - run_start + 1
+            n_taper = min ( settings["arrow_taper_residues"], max ( 1, run_length // 2 ) )
+            dist_from_end = run_end - i   # 0 at the run's own last residue
+            if run_length > 1 and dist_from_end <= n_taper:
+                t = dist_from_end / float ( n_taper )   # 0 at the tip, 1 at the base
+                base_w = settings["arrow_half_width"]
+                tip_w  = settings["arrow_tip_half_width"]
+                half_widths[i]  = tip_w + t * ( base_w - tip_w )
                 half_heights[i] = settings["strand_half_height"]
             else:
                 half_widths[i]  = settings["strand_half_width"]
@@ -364,7 +465,7 @@ def _colors_for_codes_batch ( ss_codes, settings ):
     return out
 
 
-def build_ribbon_mesh ( chain_record, ss_codes, spline_detail = 5, settings = None ):
+def build_ribbon_mesh ( chain_record, ss_codes, spline_detail = 5, settings = None, residue_colors = None ):
     """ Builds the triangle mesh for ONE chain record (see extract_
     backbone_chains()) -- coords/normals/colors are per-vertex, `indices`
     are triangle-list indices (3 per triangle) INTO those per-vertex
@@ -412,13 +513,26 @@ def build_ribbon_mesh ( chain_record, ss_codes, spline_detail = 5, settings = No
          and averaging them barely moves anything -- only real corners
          get rounded off, which is the desired look. End caps were never
          affected by any of this (their own fan winding was verified
-         consistent back in round 2) and remain unchanged. """
+         consistent back in round 2) and remain unchanged.
+
+    `residue_colors` (2026-09-28, per-representation colour schemes):
+    optional (n_residues, 3) RGB array, one row per residue of THIS
+    record, used instead of the settings' SS-type colours -- see
+    residue_colors_for_records() below. None keeps the SS colouring. """
     settings = _resolve_settings ( settings )
     ca_coords = chain_record["ca"]
     o_coords  = chain_record["o"]
     n_residues = len ( ca_coords )
 
-    spline_points, t_values = catmull_rom ( ca_coords, subdivisions = spline_detail )
+    # [EN] 2026-09-26: the SPLINE CENTERLINE is built from smoothed strand
+    # guide points (see _smooth_strand_guide_points()'s own docstring for
+    # the full "sinuosa vs flecha" story) -- but orientation/twist below
+    # still reads the ORIGINAL, unsmoothed ca_coords/o_coords, since twist
+    # is real per-residue chemistry the user explicitly wants preserved
+    # ("as vezes torcidas"), not something to smooth away.
+    smoothed_ca_coords = _smooth_strand_guide_points (
+        ca_coords, ss_codes, settings["strand_smoothing_iterations"] )
+    spline_points, t_values = catmull_rom ( smoothed_ca_coords, subdivisions = spline_detail )
     side_per_residue = _compute_side_vectors ( ca_coords, o_coords )
     side_per_point    = _interpolate_side_vectors ( side_per_residue, t_values )
 
@@ -478,7 +592,10 @@ def build_ribbon_mesh ( chain_record, ss_codes, spline_detail = 5, settings = No
     half_widths_pt, half_heights_pt = _interpolate_half_extents_batch ( half_widths, half_heights, t_values )
 
     residue_idx_for_color = np.clip ( np.round ( t_values ).astype ( np.int64 ), 0, n_residues - 1 )
-    colors_per_point = _colors_for_codes_batch ( ss_codes, settings )[ residue_idx_for_color ]
+    if residue_colors is None:
+        residue_colors = _colors_for_codes_batch ( ss_codes, settings )
+    residue_colors = np.asarray ( residue_colors, dtype = np.float64 )
+    colors_per_point = residue_colors[ residue_idx_for_color ]
 
     # [EN] side-wall triangles between consecutive rings. Every ring uses
     # the SAME octagon topology (see _RIBBON_PROFILE_SIDES's own
@@ -592,7 +709,7 @@ def build_ribbon_mesh ( chain_record, ss_codes, spline_detail = 5, settings = No
         count = len ( profile )
         if count < 3:
             continue
-        color = _color_for_code ( ss_codes[ int ( round ( np.clip ( t_values[k], 0, n_residues - 1 ) ) ) ], settings )
+        color = residue_colors[ int ( round ( np.clip ( t_values[k], 0, n_residues - 1 ) ) ) ]
         # [EN] BUG FIX (found alongside the wall-normal sign fix above, by
         # the same winding-vs-normal dot-product check): the two caps use
         # OPPOSITE fan winding (`winding` below, reversed for k == m-1, so
@@ -639,8 +756,135 @@ def build_ribbon_mesh ( chain_record, ss_codes, spline_detail = 5, settings = No
     return coords.astype ( np.float32 ), normals.astype ( np.float32 ), colors.astype ( np.float32 ), indices.astype ( np.uint32 )
 
 
+# [EN] 2026-09-28 user request ("o usuario pode escolher o padrao de cores
+# para o cartoon (cada representacao pode ter um padrao diferente)... a
+# possibilidade de colorir tipo rainbow"). The colour scheme is a property
+# of each CartoonRepresentation (rep.color_mode), passed down here --
+# NOT a global gl_parameters key -- so two objects can show different
+# schemes at the same time. Same short, hand-picked chain cycle the
+# molecular-surface tool already uses for its own "Chain" mode (util/
+# molecular_surface.py's _CHAIN_COLOR_CYCLE -- duplicated, not imported:
+# that module lives in the EasyHybrid tree, outside the vismol package).
+CARTOON_COLOR_MODES = ( "ss", "rainbow", "chain", "atom", "uniform" )
+
+_CHAIN_COLOR_CYCLE = (
+    ( 0.90, 0.30, 0.30 ), ( 0.30, 0.55, 0.90 ), ( 0.35, 0.75, 0.35 ), ( 0.95, 0.70, 0.20 ),
+    ( 0.65, 0.35, 0.85 ), ( 0.30, 0.80, 0.80 ), ( 0.90, 0.45, 0.70 ), ( 0.55, 0.55, 0.55 ),
+)
+
+
+def rainbow_colors ( fractions ):
+    """ Blue (N-terminus, fraction 0) -> cyan -> green -> yellow -> red
+    (C-terminus, fraction 1) -- the usual "rainbow"/"spectrum" cartoon
+    convention (PyMOL's spectrum, Chimera's rainbow): a plain HSV hue
+    sweep from 240 deg down to 0 deg at full saturation/value. """
+    f = np.clip ( np.asarray ( fractions, dtype = np.float64 ), 0.0, 1.0 )
+    h = ( 1.0 - f ) * 4.0            # hue in sextants: 4 = blue ... 0 = red
+    x = 1.0 - np.abs ( np.mod ( h, 2.0 ) - 1.0 )
+    out = np.zeros ( ( len ( f ), 3 ), dtype = np.float64 )
+    s0 = h < 1.0                     # red -> yellow
+    s1 = ( h >= 1.0 ) & ( h < 2.0 )  # yellow -> green
+    s2 = ( h >= 2.0 ) & ( h < 3.0 )  # green -> cyan
+    s3 = h >= 3.0                    # cyan -> blue
+    out[s0] = np.stack ( [ np.ones ( s0.sum ( ) ), x[s0], np.zeros ( s0.sum ( ) ) ], axis = 1 )
+    out[s1] = np.stack ( [ x[s1], np.ones ( s1.sum ( ) ), np.zeros ( s1.sum ( ) ) ], axis = 1 )
+    out[s2] = np.stack ( [ np.zeros ( s2.sum ( ) ), np.ones ( s2.sum ( ) ), x[s2] ], axis = 1 )
+    out[s3] = np.stack ( [ np.zeros ( s3.sum ( ) ), x[s3], np.ones ( s3.sum ( ) ) ], axis = 1 )
+    return out
+
+
+def residue_colors_for_records ( chain_records, ss_codes_per_record, settings = None,
+                                 color_mode = "ss", uniform_color = None ):
+    """ One (n_residues, 3) RGB array per chain record, for `color_mode`:
+        "ss"      -- by secondary structure (the Preferences > Cartoon
+                     helix/strand/coil colours; the original behaviour);
+        "rainbow" -- blue->red from N- to C-terminus, PER CHAIN: the
+                     position is counted over ALL of that chain's records
+                     (a chain split by a sequence gap still reads as one
+                     continuous spectrum), computed BEFORE any partial-
+                     display filtering, so hiding part of a chain never
+                     shifts the colours of what stays visible;
+        "chain"   -- one colour per chain (_CHAIN_COLOR_CYCLE);
+        "atom"    -- each residue's own Ca atom colour (atom.color), so a
+                     system colour / "Change Color" on the selection is
+                     reflected on the ribbon;
+        "uniform" -- one flat colour (`uniform_color`, RGB 0-1).
+    Unknown modes fall back to "ss". """
+    settings = _resolve_settings ( settings )
+    if color_mode == "rainbow":
+        totals = { }
+        for record in chain_records:
+            key = id ( record["chain"] )
+            totals[key] = totals.get ( key, 0 ) + len ( record["ca"] )
+        seen = { }
+        out = [ ]
+        for record in chain_records:
+            key = id ( record["chain"] )
+            n = len ( record["ca"] )
+            start = seen.get ( key, 0 )
+            seen[key] = start + n
+            denominator = max ( totals[key] - 1, 1 )
+            out.append ( rainbow_colors ( ( start + np.arange ( n ) ) / denominator ) )
+        return out
+    if color_mode == "chain":
+        chain_slot = { }
+        out = [ ]
+        for record in chain_records:
+            key = id ( record["chain"] )
+            if key not in chain_slot:
+                chain_slot[key] = len ( chain_slot )
+            color = _CHAIN_COLOR_CYCLE[ chain_slot[key] % len ( _CHAIN_COLOR_CYCLE ) ]
+            out.append ( np.tile ( np.asarray ( color, dtype = np.float64 ), ( len ( record["ca"] ), 1 ) ) )
+        return out
+    if color_mode == "atom":
+        return [ np.asarray ( [ np.asarray ( atom.color, dtype = np.float64 ).ravel ( )[:3]
+                                for atom in record["ca_atoms"] ], dtype = np.float64 )
+                 for record in chain_records ]
+    if color_mode == "uniform":
+        color = np.asarray ( uniform_color if uniform_color is not None else settings["color_coil"],
+                             dtype = np.float64 ).ravel ( )[:3]
+        return [ np.tile ( color, ( len ( record["ca"] ), 1 ) ) for record in chain_records ]
+    return [ _colors_for_codes_batch ( codes, settings ) for codes in ss_codes_per_record ]
+
+
+def split_record_by_mask ( record, mask ):
+    """ [EN] 2026-09-28 user request ("representar apenas parte da
+    estrutura na forma de cartoon, uma vez selecionada e atribuida pelo
+    usuario"): splits one chain record into the contiguous runs where
+    `mask` (one bool per residue) is True. Returns a list of
+    (sub_record, start, end) with end exclusive, so the caller can slice
+    that record's own per-residue arrays (SS codes, colours) with the
+    same bounds. Runs shorter than 2 residues are dropped -- same rule as
+    extract_backbone_chains() (nothing to spline through). Deliberately
+    applied AFTER secondary-structure classification of the FULL chain:
+    P-SEA is a windowed Ca criterion, so classifying only the visible
+    fragment would mislabel residues near every cut (half a helix shown
+    must still be drawn as helix). """
+    mask = np.asarray ( mask, dtype = bool )
+    pieces = [ ]
+    n = len ( mask )
+    i = 0
+    while i < n:
+        if not mask[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and mask[j]:
+            j += 1
+        if j - i >= 2:
+            sub = dict ( record )
+            sub["residues"] = record["residues"][i:j]
+            sub["ca"]       = record["ca"][i:j]
+            sub["o"]        = record["o"][i:j]
+            sub["ca_atoms"] = record["ca_atoms"][i:j]
+            pieces.append ( ( sub, i, j ) )
+        i = j
+    return pieces
+
+
 def build_ribbon_mesh_for_object ( vismol_object, frame = None, spline_detail = 5, settings = None,
-                                    cached_ss_codes = None, return_ss_codes = False ):
+                                    cached_ss_codes = None, return_ss_codes = False,
+                                    color_mode = "ss", uniform_color = None, ca_filter = None ):
     """ Single entry point CartoonRepresentation calls -- analogous in
     ROLE to the old cartoon.cartoon(vismol_object, ...) one-liner it
     replaces, but combining extract_backbone_chains() + classify_
@@ -676,7 +920,14 @@ def build_ribbon_mesh_for_object ( vismol_object, frame = None, spline_detail = 
     array). `return_ss_codes=True` additionally returns the per-chain
     codes actually used (freshly computed OR reused) as a 5th value, so
     the caller can cache them for the NEXT call -- default False keeps
-    the original 4-tuple return for every existing caller unchanged. """
+    the original 4-tuple return for every existing caller unchanged.
+
+    [EN] 2026-09-28: `color_mode`/`uniform_color` -- see
+    residue_colors_for_records(). `ca_filter` -- optional callable
+    (Ca Atom -> bool); only residues whose Ca it accepts are meshed
+    (partial cartoon, see split_record_by_mask()). Classification, the SS cache
+    and rainbow positions are all still computed over the FULL chain, so
+    changing what is shown never changes how the rest is drawn. """
     settings = _resolve_settings ( settings )
     chain_records = extract_backbone_chains ( vismol_object, frame = frame )
 
@@ -699,20 +950,35 @@ def build_ribbon_mesh_for_object ( vismol_object, frame = None, spline_detail = 
         else:
             ss_codes = classify_secondary_structure (
                 record["ca"],
-                min_run                = settings["min_run"],
+                min_run_helix          = settings["min_run_helix"],
+                min_run_strand         = settings["min_run_strand"],
                 helix_tolerance_scale  = settings["helix_tolerance_scale"],
                 strand_tolerance_scale = settings["strand_tolerance_scale"],
             )
         ss_codes_per_chain.append ( ss_codes )
 
-        coords, normals, colors, indices = build_ribbon_mesh ( record, ss_codes, spline_detail = spline_detail, settings = settings )
-        if len ( coords ) == 0:
-            continue
-        all_coords.append ( coords )
-        all_normals.append ( normals )
-        all_colors.append ( colors )
-        all_indices.append ( indices + vertex_offset )
-        vertex_offset += len ( coords )
+    residue_colors_per_chain = residue_colors_for_records (
+        chain_records, ss_codes_per_chain, settings = settings,
+        color_mode = color_mode, uniform_color = uniform_color )
+
+    for record, ss_codes, residue_colors in zip ( chain_records, ss_codes_per_chain, residue_colors_per_chain ):
+        if ca_filter is None:
+            pieces = [ ( record, 0, len ( record["ca"] ) ) ]
+        else:
+            mask = [ bool ( ca_filter ( ca_atom ) ) for ca_atom in record["ca_atoms"] ]
+            pieces = split_record_by_mask ( record, mask )
+
+        for piece, start, end in pieces:
+            coords, normals, colors, indices = build_ribbon_mesh (
+                piece, np.asarray ( ss_codes )[start:end], spline_detail = spline_detail,
+                settings = settings, residue_colors = residue_colors[start:end] )
+            if len ( coords ) == 0:
+                continue
+            all_coords.append ( coords )
+            all_normals.append ( normals )
+            all_colors.append ( colors )
+            all_indices.append ( indices + vertex_offset )
+            vertex_offset += len ( coords )
 
     if not all_coords:
         empty3 = np.zeros ( ( 0, 3 ), dtype = np.float32 )

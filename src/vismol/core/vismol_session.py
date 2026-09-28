@@ -177,6 +177,13 @@ class VismolSession(Config):
             #print('\n\n')
         self._change_attributes_for_atoms(selection.selected_atoms, rep_type, show)
         for vm_object in selection.selected_objects:
+            if rep_type == "cartoon":
+                # [EN] 2026-09-28 user request: partial cartoon, only for
+                # the residues of the selection -- handled apart from the
+                # index-list reps below (the ribbon is a generated mesh,
+                # see _show_or_hide_cartoon()).
+                self._show_or_hide_cartoon(vm_object)
+                continue
             if vm_object.representations[rep_type] is None:
                 vm_object.create_representation(rep_type = rep_type)
             show_hide_indexes = []
@@ -260,10 +267,6 @@ class VismolSession(Config):
                 logger.error("Not implementer for 'surface' yet.")
                 raise NotImplementedError("Not implementer for 'surface' yet.")
             
-            elif rep_type == "cartoon":
-                logger.error("Not implementer for 'cartoon' yet.")
-                raise NotImplementedError("Not implementer for 'cartoon' yet.")
-            
             elif rep_type == "labels":
                 for atom in vm_object.atoms.values():
                     if atom.labels:
@@ -289,6 +292,27 @@ class VismolSession(Config):
         self.vm_widget.queue_draw()
         return selection
         
+    def _show_or_hide_cartoon(self, vm_object):
+        """ Cartoon counterpart of show_or_hide()'s per-object block. The
+            atom.cartoon flags were already set by
+            _change_attributes_for_atoms(); a residue is drawn when its CA
+            is flagged (see CartoonRepresentation._residue_is_shown()).
+            Since the ribbon is a generated mesh (no index list to swap),
+            showing/hiding part of it means rebuilding it -- reusing the
+            cached secondary structure, which is always computed over the
+            FULL chain, so hiding a piece never changes how the rest is
+            classified. Creates the representation on first use with
+            show_all=False, so only the selection appears. """
+        rep = vm_object.representations.get("cartoon")
+        if rep is None:
+            if not any(getattr(atom, "cartoon", False) for atom in vm_object.atoms.values()):
+                return
+            vm_object.create_representation(rep_type="cartoon", show_all=False)
+            rep = vm_object.representations["cartoon"]
+        else:
+            rep.rebuild()
+        rep.active = rep.has_shown_residues()
+
     def forward_frame(self):
         """ Function doc """
         #return 0

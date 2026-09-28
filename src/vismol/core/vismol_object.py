@@ -361,7 +361,7 @@ class VismolObject:
             return cov
         return self.index_bonds
 
-    def create_representation(self, rep_type="lines", indexes=None):
+    def create_representation(self, rep_type="lines", indexes=None, show_all=True):
         """   
         Function doc: Creates a visualization representation for the VismolObject.
 
@@ -509,8 +509,13 @@ class VismolObject:
             # longer takes rep_type='mol'/indexes=[] -- neither was ever
             # used by the mesh-building path, only by the old atom-frames-
             # based Representation.__init__() this class still doesn't call.
+            # [EN] 2026-09-28: show_all=False is used by vm_session.
+            # show_or_hide() (partial cartoon of a selection), which sets
+            # the per-atom atom.cartoon flags itself; the default (True)
+            # keeps the old "whole object" behaviour for every other caller.
             self.representations["cartoon"] = CartoonRepresentation (
-                    vismol_object = self, vismol_glcore = self.vm_session.vm_glcore )
+                    vismol_object = self, vismol_glcore = self.vm_session.vm_glcore,
+                    show_all = show_all )
         
         # elif rep_type == "dotted_lines":
         #     self.representations["dotted_lines"] = LinesRepresentation(self, self.vm_session.vm_glcore,

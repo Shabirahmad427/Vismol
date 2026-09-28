@@ -72,6 +72,35 @@ class GLCamera():
         self.vertical_angle = 0.0
         self.min_znear = 0.1
         self.min_zfar = 9.0
+        # [EN] 2026-09-26 user request ("um parametro para a extensao do
+        # fog") -- multiplies min_zfar ONLY for the fog-range computation
+        # below (see update_fog()), decoupled from min_zfar's OTHER role
+        # as the hard zoom-out floor elsewhere (mouse_scroll()'s slab
+        # guard, _zoom_view()'s own clamp) -- changing min_zfar itself, as
+        # this class's own (now outdated) update_fog() docstring used to
+        # suggest, would have side-affected zoom behaviour too. 1.0 =
+        # original behaviour (fog span exactly min_zfar); >1 = fog starts
+        # closer to the camera and reaches further into the scene (more
+        # pronounced depth cue); <1 = fog stays confined closer to z_far.
+        self.fog_range_scale = 1.0
+        # [EN] 2026-09-28 user request (Preferences > General > Fog: "mexer
+        # na intensidade, onde comeca e onde termina"). Defaults reproduce
+        # the previous look exactly (fog on, full intensity, automatic
+        # range) -- see update_fog() and VismolGLCore.load_fog().
+        #   fog_enabled       -- False = no fog at all (intensity sent as 0)
+        #   fog_intensity     -- 0..1, how much fog is reached at fog_end
+        #                        (1.0 = fully fog-coloured, the old behaviour)
+        #   fog_custom_range  -- False = automatic range (old formula);
+        #                        True = fog_start/end_percent below
+        #   fog_start_percent / fog_end_percent -- 0..100 % of the VISIBLE
+        #                        depth (0 = near clipping plane, 100 = far
+        #                        clipping plane), so the fog follows zoom/
+        #                        slab changes instead of fixed Angstroms.
+        self.fog_enabled = True
+        self.fog_intensity = 1.0
+        self.fog_custom_range = False
+        self.fog_start_percent = 50.0
+        self.fog_end_percent = 100.0
         dist = np.linalg.norm(pos - zrp)
         if dist <= 10.0:
             self.z_near = dist - 3.0
@@ -233,16 +262,52 @@ class GLCamera():
     def update_fog(self):
         """ Updates automatically the fog. This function was created to avoid
             errors when the fog values were changed manually, this way, the fog
-            start and end will always have constant values. If you want to
-            expand or decrease the fog distance, change the self.min_zfar
-            instead of changing this function.
-            
+            start and end will always have constant values. To expand or
+            decrease the fog's own extent without also affecting min_zfar's
+            other role as the zoom-out floor, set self.fog_range_scale
+            instead (see its own docstring in __init__).
+
             Returns:
                 True
         """
-        self.fog_end = self.z_far
-        self.fog_start = self.fog_end - self.min_zfar 
+        if getattr(self, "fog_custom_range", False):
+            # effective near plane: the stored z_near may be negative after
+            # widening the clipping slab; the projection clamps it to
+            # min_znear, so the visible depth starts there too.
+            near = max(float(self.z_near), float(self.min_znear))
+            depth = max(float(self.z_far) - near, 1e-3)
+            start = min(max(float(self.fog_start_percent), 0.0), 100.0)
+            end = min(max(float(self.fog_end_percent), 0.0), 100.0)
+            # every shader divides by (fog_end - fog_start): keep a
+            # strictly positive span even if start >= end was typed in.
+            if end <= start:
+                end = min(start + 1.0, 100.0)
+                start = end - 1.0
+            self.fog_start = near + depth * start / 100.0
+            self.fog_end = near + depth * end / 100.0
+        else:
+            self.fog_end = self.z_far
+            self.fog_start = self.fog_end - self.min_zfar * self.fog_range_scale
         return True
+
+    def get_effective_fog_intensity(self):
+        """ Value uploaded as the shaders' fog_intensity uniform: 0 when
+            the fog is disabled, otherwise fog_intensity clamped to 0..1. """
+        if not getattr(self, "fog_enabled", True):
+            return 0.0
+        return float(min(max(getattr(self, "fog_intensity", 1.0), 0.0), 1.0))
+
+    def apply_fog_parameters(self, gl_parameters):
+        """ Reads the fog_* keys of gl_parameters (Preferences > General
+            > Fog) into this camera and recomputes the fog range. Missing
+            keys keep the defaults, i.e. the original look. """
+        self.fog_range_scale = float(gl_parameters.get("fog_range_scale", 1.0))
+        self.fog_enabled = bool(gl_parameters.get("fog_enabled", True))
+        self.fog_intensity = float(gl_parameters.get("fog_intensity", 100.0)) / 100.0
+        self.fog_custom_range = bool(gl_parameters.get("fog_custom_range", False))
+        self.fog_start_percent = float(gl_parameters.get("fog_start_percent", 50.0))
+        self.fog_end_percent = float(gl_parameters.get("fog_end_percent", 100.0))
+        self.update_fog()
     
     def print_parms(self):
         """ Prints camera parameters in the terminal. Method created only for

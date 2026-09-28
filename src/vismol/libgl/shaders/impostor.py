@@ -61,6 +61,7 @@ uniform mat4 model_mat;
 uniform vec4 fog_color;
 uniform float fog_start;
 uniform float fog_end;
+uniform float fog_intensity;
 
 vec4 outline(float distance, float linewidth, float antialias, vec4 fg_color, vec4 bg_color){
     vec4 frag_color;
@@ -131,7 +132,7 @@ void main(){
     //vec4 temp_color = outline(distance, 1.0, 1.0, vec4(0,0,0,1), color);
     float dist = abs(frag_coord.z);
     if(dist>=fog_start){
-        float fog_factor = (fog_end-dist)/(fog_end-fog_start);
+        float fog_factor = 1.0 - fog_intensity * (1.0 - clamp((fog_end-dist)/(fog_end-fog_start), 0.0, 1.0));
         final_color = mix(fog_color, color, fog_factor);
     }
     else{
@@ -417,6 +418,7 @@ uniform Light my_light;
 uniform vec4 fog_color;
 uniform float fog_start;
 uniform float fog_end;
+uniform float fog_intensity;
 
 in vec3 frag_color;
 in vec3 frag_coord;
@@ -459,7 +461,7 @@ void main() {
     
     float dist = abs(depth.z);
     if(dist>=fog_start){
-        float fog_factor = (fog_end-dist)/(fog_end-fog_start);
+        float fog_factor = 1.0 - fog_intensity * (1.0 - clamp((fog_end-dist)/(fog_end-fog_start), 0.0, 1.0));
         final_color = mix(fog_color, vec4(ambient + diffuse, 1.0), fog_factor);
     }
     else{
