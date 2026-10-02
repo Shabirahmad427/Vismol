@@ -32,6 +32,37 @@
 import numpy as np
 
 
+# [EN] 2026-09-28 user request ("nossa representacao de cartoon esta
+# considerando que nao possam existir quebras na cadeia principal"):
+# backbone continuity is decided by GEOMETRY, not by residue numbering --
+# see _residues_are_bonded() below. Thresholds:
+#   PEPTIDE_BOND_MAX_DISTANCE: C(i)-N(i+1); a real peptide bond is ~1.33 A,
+#       2.0 A leaves room for poor/strained geometry while any genuinely
+#       missing residue puts it several Angstroms away.
+#   CA_CA_MAX_DISTANCE: fallback for Ca-only models (no C/N atoms): trans
+#       peptides give ~3.80 A, cis ~2.9 A; a missing residue gives >= ~4.5 A.
+PEPTIDE_BOND_MAX_DISTANCE = 2.0
+CA_CA_MAX_DISTANCE        = 4.3
+
+
+def _residues_are_bonded ( prev, curr ):
+    """ True if residue `curr` continues the backbone of residue `prev`:
+    a peptide bond C(prev)-N(curr) when both atoms exist, else the Ca-Ca
+    distance. `prev`/`curr` are the per-residue coordinate dicts built in
+    extract_backbone_chains() ("ca", "c", "n": np.ndarray or None). """
+    # plain squared-distance arithmetic, not np.linalg.norm: this runs once
+    # per residue on every rebuild (every trajectory frame), where numpy's
+    # per-call overhead on 3-element vectors dominates.
+    if prev["c"] is not None and curr["n"] is not None:
+        a, b, limit = prev["c"], curr["n"], PEPTIDE_BOND_MAX_DISTANCE
+    else:
+        a, b, limit = prev["ca"], curr["ca"], CA_CA_MAX_DISTANCE
+    dx = float ( b[0] ) - float ( a[0] )
+    dy = float ( b[1] ) - float ( a[1] )
+    dz = float ( b[2] ) - float ( a[2] )
+    return dx * dx + dy * dy + dz * dz <= limit * limit
+
+
 def extract_backbone_chains ( vismol_object, frame = None ):
     """ Returns a list of per-chain backbone records, one per CONTIGUOUS
     protein run:
@@ -40,11 +71,21 @@ def extract_backbone_chains ( vismol_object, frame = None ):
           "ca_atoms": [Atom, ...] }
 
     A residue starts a NEW record whenever (a) it belongs to a different
-    Chain object than the one currently running, or (b) its own PDB
-    residue.index isn't exactly `previous_residue.index + 1` (a real gap --
-    missing residues, a ligand/HETATM block, ...) -- so a chain with an
-    internal gap correctly produces TWO separate ribbon segments, not one
+    Chain object than the one currently running, or (b) it is not
+    covalently continuous with the previous residue -- no peptide bond
+    C(i)-N(i+1), or, for Ca-only models, a Ca-Ca distance too long for
+    adjacent residues (see _residues_are_bonded()) -- so a chain with an
+    internal gap correctly produces separate ribbon segments, not one
     falsely-continuous one bridging the gap.
+
+    [EN] 2026-09-28: (b) used to be "residue.index != previous + 1", i.e.
+    it trusted the NUMBERING. That fails for prepared/renumbered systems
+    (AMBER prmtop, PSF, tleap/psfgen output...), which number residues
+    sequentially straight across missing loops and often drop chain IDs:
+    6VXX renumbered that way became ONE ribbon with 35 bridged gaps (up to
+    28 A, across all 3 chains). It also broke the ribbon wherever the
+    numbering jumps without any missing residue (insertion codes, antibody
+    numbering schemes). Geometry is the ground truth either way.
 
     Residues that aren't recognised as protein (residue.is_protein False --
     ligands, waters, ions; see Residue._is_protein(), reused as-is here, a
@@ -72,25 +113,42 @@ def extract_backbone_chains ( vismol_object, frame = None ):
 
             ca_atom = None
             o_atom  = None
+            c_atom  = None
+            n_atom  = None
             if residue.is_protein:
                 for atom in residue.atoms.values ( ):
                     if atom.name == "CA":
                         ca_atom = atom
                     elif atom.name == "O":
                         o_atom = atom
+                    elif atom.name == "C":
+                        c_atom = atom
+                    elif atom.name == "N":
+                        n_atom = atom
 
             if ca_atom is None:
                 current = None
                 continue
 
+            # [EN] Continuity is judged on FRAME 0 (the structure's own
+            # topology), never on the frame being drawn: where the chain
+            # breaks is a property of the molecule, not of one trajectory
+            # frame -- judging it per frame would let a single distorted
+            # frame split/merge ribbons (and invalidate the static-SS
+            # cache, which is keyed on this segmentation).
+            backbone = { "ca": ca_atom.coords ( 0 ),
+                         "c":  c_atom.coords ( 0 ) if c_atom is not None else None,
+                         "n":  n_atom.coords ( 0 ) if n_atom is not None else None }
+
             starts_new = (
                 current is None
                 or current["chain"] is not chain
-                or residue.index != current["residues"][-1].index + 1
+                or not _residues_are_bonded ( current["_last_backbone"], backbone )
             )
             if starts_new:
                 current = { "chain": chain, "residues": [ ], "_ca": [ ], "o": [ ], "ca_atoms": [ ] }
                 records.append ( current )
+            current["_last_backbone"] = backbone
 
             current["residues"].append ( residue )
             current["_ca"].append ( ca_atom.coords ( frame ) )
@@ -108,6 +166,7 @@ def extract_backbone_chains ( vismol_object, frame = None ):
             continue
         record["ca"] = np.asarray ( record["_ca"], dtype = np.float64 )
         del record["_ca"]
+        del record["_last_backbone"]
         result.append ( record )
     return result
 

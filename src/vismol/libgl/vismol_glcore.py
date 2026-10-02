@@ -1393,6 +1393,19 @@ class VismolGLCore:
                         if rep.is_dynamic:
                             rep.was_rep_ind_modified = True
                             rep.was_sel_ind_modified = True
+            # [EN] 2026-09-29 PERFORMANCE BUG FIX (user report: "a
+            # representacao de cartoon esta reduzindo muito a performance"):
+            # this flag was never reset here -- EasyHybridSession.set_frame()
+            # (called on load, by trajectory windows, ...) sets it and it
+            # stayed True FOREVER, so every later redraw (each mouse event
+            # while rotating) re-marked every active representation dirty.
+            # Atom-based reps "only" re-uploaded their coordinate VBOs every
+            # frame; Cartoon rebuilds its whole mesh on that flag (measured
+            # on 6VXX: 21 full rebuilds in 21 redraws, 254 ms/frame). It is
+            # a one-shot "the frame changed" signal: consumed right here.
+            # (The Builder's live atom drags mark their own reps directly --
+            # see atom_ops.move_atom() -- they don't rely on it staying set.)
+            self.updated_coords = False
         if self.selection_box_picking:
             self._selection_box_pick()
         if self.picking:
@@ -1485,7 +1498,16 @@ class VismolGLCore:
         if ( getattr ( self.vm_session, "builder_atom_mode", False )
              and getattr ( self.vm_session, "builder_tool", "add" ) == "delete"
              and self.atom_picked is not None ):
-            click_mode.handle_click_to_delete_atom ( self )
+            # [EN] 2026-09-28: an exception here used to abort render()
+            # right after the picking pass, so the screen showed the
+            # picking-ID colours instead of the scene. Report it and keep
+            # drawing the normal frame.
+            try:
+                click_mode.handle_click_to_delete_atom ( self )
+            except Exception:
+                import traceback
+                traceback.print_exc ( )
+                self.atom_picked = None
 
         # [EN] Builder "Bond Order" tool -- same "let the click fall
         # through to normal picking first" reasoning as "delete" just

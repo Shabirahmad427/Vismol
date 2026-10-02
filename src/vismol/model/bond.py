@@ -153,12 +153,21 @@ class Bond:
         # - Remember that the "index" attribute refers to the numbering of atoms 
         # (it is not a zero base, it starts at 1 for the first atom)
         # these indices are zero base numbering (it starts at 0 for the first atom)
-        if atom_index_i:
+        # [EN] 2026-09-28 BUG FIX (user report: KeyError deleting an atom in
+        # the Builder, then a white screen of picking-ID colours): this
+        # used to be `if atom_index_i:`, so a legitimate index 0 was
+        # treated as "not given" and replaced by atom_i.index-1. Every
+        # caller passes the real 0-based index explicitly; whenever the
+        # 1-based atom.index had drifted from it (Builder deletions
+        # renumber atom_id), every bond of atom 0 pointed at the wrong --
+        # or a non-existent -- atom. Only a MISSING index (None) falls
+        # back to atom.index-1 now.
+        if atom_index_i is not None:
             self.atom_index_i = atom_index_i
         else:
             self.atom_index_i = atom_i.index-1
         
-        if atom_index_j:
+        if atom_index_j is not None:
             self.atom_index_j = atom_index_j
         else:
             self.atom_index_j = atom_j.index-1

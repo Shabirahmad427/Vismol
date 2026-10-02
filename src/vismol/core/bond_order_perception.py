@@ -242,13 +242,60 @@ class _Perceptor:
 
     # --- busca com backtracking e poda -------------------------------------
 
+    # [EN] 2026-10-02 (user report: "Edit in Builder" on a real protein
+    # never finished). solve() used to backtrack over EVERY free bond of the
+    # whole molecule at once -- exponential, fine for a ligand, hopeless for
+    # a 660-atom protein. Two changes, same optimum where it matters:
+    #  1) free bonds are split into connected components (bonds linked
+    #     through shared atoms). Penalties are per atom and two components
+    #     share no atom, so minimising each component separately gives
+    #     EXACTLY the global optimum -- just without the combinatorial
+    #     product across unrelated parts of the molecule.
+    #  2) each component's search gets a node budget; when it runs out the
+    #     best assignment found so far is kept (the search always starts
+    #     from the all-single assignment, so there is always an answer)
+    #     instead of hanging. Real ligands/rings finish far below it.
+    MAX_SEARCH_NODES_PER_COMPONENT = 200000
+
+    def _free_bond_components(self, free):
+        parent = {}
+        def find(x):
+            while parent.setdefault(x, x) != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        for (i, j) in free:
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[ri] = rj
+        groups = defaultdict(list)
+        for b in free:
+            groups[find(b[0])].append(b)
+        return list(groups.values())
+
     def solve(self):
         fixed_pre = self._apply_acid_models(set())
         free, fixed = self._apply_hard_rules(prefixed=fixed_pre)
-        free.sort(key=lambda b: (len(self.adj[b[0]]) + len(self.adj[b[1]])))
 
-        self.best_tps = [float('inf')]
-        self.best_assignment = [dict(self.order)]
+        free_atoms_all = set()
+        for b in free:
+            free_atoms_all.add(b[0]); free_atoms_all.add(b[1])
+        fixed_penalty = 0
+        for a in range(self.n):
+            if a not in free_atoms_all:
+                fixed_penalty += _penalty(self.elements[a], self._atom_valence(a))
+
+        total = fixed_penalty
+        self.search_exhausted = True
+        for component in self._free_bond_components(free):
+            total += self._solve_component(component)
+        return self.order, total
+
+    def _solve_component(self, free):
+        """ Minimises the summed penalty of this component's atoms over its
+            free bonds (self.order already holds every other bond). Leaves
+            the best assignment in self.order and returns its penalty. """
+        free = sorted(free, key=lambda b: (len(self.adj[b[0]]) + len(self.adj[b[1]])))
         max_orders = {b: self._max_order_for(b) for b in free}
 
         # Para cada atomo, quantas de suas ligacoes sao "livres" (decididas
@@ -258,39 +305,43 @@ class _Perceptor:
         for b in free:
             free_bonds_of_atom[b[0]] += 1
             free_bonds_of_atom[b[1]] += 1
-
-        # ordem de atribuicao: marcamos, a cada passo, quantas ligacoes livres
-        # de cada atomo ja foram decididas.
         decided_of_atom = defaultdict(int)
+        free_atoms = list(free_bonds_of_atom)
 
-        free_atoms = set()
-        for b in free:
-            free_atoms.add(b[0]); free_atoms.add(b[1])
+        def component_penalty():
+            return sum(_penalty(self.elements[a], self._atom_valence(a)) for a in free_atoms)
 
-        fixed_penalty = 0
-        for a in range(self.n):
-            if a not in free_atoms:
-                fixed_penalty += _penalty(self.elements[a], self._atom_valence(a))
+        # start from the current (all-single) assignment, so a result
+        # always exists even if the node budget runs out
+        best = [component_penalty(), {b: self.order[b] for b in free}]
+        nodes = [0]
 
-        def lower_bound():
-            """ Limite inferior VALIDO: soma a penalidade apenas dos atomos cujas
-                ligacoes livres ja foram TODAS decididas (penalidade definitiva).
-                Atomos ainda incompletos contribuem 0 (otimista), garantindo que
-                nunca superestimamos -> poda segura. """
-            s = fixed_penalty
-            for a in free_atoms:
-                if decided_of_atom[a] == free_bonds_of_atom[a]:
-                    s += _penalty(self.elements[a], self._atom_valence(a))
-            return s
+        # Limite inferior VALIDO, mantido INCREMENTALMENTE: soma a penalidade
+        # apenas dos atomos cujas ligacoes livres ja foram TODAS decididas
+        # (penalidade definitiva); atomos incompletos contribuem 0 (otimista)
+        # -> poda segura. [EN] 2026-10-02: used to be recomputed over every
+        # free atom at every search node (O(n) per node: ~95 s on a whole
+        # protein); now updated only for the 2 atoms a decision touches.
+        completed = [0]
+
+        def mark(a, delta):
+            # +1: called right AFTER decided_of_atom[a] was incremented;
+            # -1: called right BEFORE it is decremented. Either way the
+            # atom is "complete" exactly when decided == free at that point.
+            if decided_of_atom[a] == free_bonds_of_atom[a]:
+                pen = _penalty(self.elements[a], self._atom_valence(a))
+                completed[0] += pen if delta > 0 else -pen
 
         def backtrack(k):
+            nodes[0] += 1
+            if nodes[0] > self.MAX_SEARCH_NODES_PER_COMPONENT:
+                self.search_exhausted = False
+                return
             if k == len(free):
-                tps = fixed_penalty + sum(
-                    _penalty(self.elements[a], self._atom_valence(a))
-                    for a in free_atoms)
-                if tps < self.best_tps[0]:
-                    self.best_tps[0] = tps
-                    self.best_assignment[0] = dict(self.order)
+                tps = component_penalty()
+                if tps < best[0]:
+                    best[0] = tps
+                    best[1] = {b: self.order[b] for b in free}
                 return
             b = free[k]
             for o in range(1, max_orders[b] + 1):
@@ -298,17 +349,20 @@ class _Perceptor:
                 va = self._atom_valence(b[0])
                 vb = self._atom_valence(b[1])
                 if va <= self._elem_cap(b[0]) and vb <= self._elem_cap(b[1]):
-                    decided_of_atom[b[0]] += 1
-                    decided_of_atom[b[1]] += 1
-                    if lower_bound() < self.best_tps[0]:
+                    decided_of_atom[b[0]] += 1; mark(b[0], +1)
+                    decided_of_atom[b[1]] += 1; mark(b[1], +1)
+                    if completed[0] < best[0]:
                         backtrack(k + 1)
-                    decided_of_atom[b[0]] -= 1
-                    decided_of_atom[b[1]] -= 1
+                    # undo in reverse order; penalties must be read while
+                    # self.order[b] still holds o (same valence as when added)
+                    mark(b[1], -1); decided_of_atom[b[1]] -= 1
+                    mark(b[0], -1); decided_of_atom[b[0]] -= 1
             self.order[b] = 1
 
         backtrack(0)
-        self.order = self.best_assignment[0]
-        return self.order, self.best_tps[0]
+        for b, o in best[1].items():
+            self.order[b] = o
+        return best[0]
 
     def _elem_cap(self, atom):
         """ Maior valencia PLAUSIVEL do atomo: a maior chave da tabela de

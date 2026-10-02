@@ -101,6 +101,15 @@ class GLCamera():
         self.fog_custom_range = False
         self.fog_start_percent = 50.0
         self.fog_end_percent = 100.0
+        # [EN] 2026-09-29 (user request: "seria interessante o fog comecar
+        # antes do ponto onde a camera esta centrada"): reference for the
+        # AUTOMATIC range (custom range unaffected) --
+        #   "far_plane" (default, the original behaviour): starts
+        #       min_zfar * fog_range_scale in front of the far plane;
+        #   "center": starts fog_center_offset A in front of the rotation
+        #       center and ends at the far plane.
+        self.fog_start_reference = "far_plane"
+        self.fog_center_offset = 5.0
         dist = np.linalg.norm(pos - zrp)
         if dist <= 10.0:
             self.z_near = dist - 3.0
@@ -285,6 +294,14 @@ class GLCamera():
                 start = end - 1.0
             self.fog_start = near + depth * start / 100.0
             self.fog_end = near + depth * end / 100.0
+        elif getattr(self, "fog_start_reference", "far_plane") == "center":
+            # The visible slab is kept centered on the rotation center by
+            # every zoom/slab operation (verified: its midpoint always
+            # equals VismolGLCore.dist_cam_zrp), so the center's distance
+            # from the camera is simply the slab midpoint.
+            center = 0.5 * (float(self.z_near) + float(self.z_far))
+            self.fog_end = self.z_far
+            self.fog_start = min(center - float(self.fog_center_offset), self.fog_end - 0.01)
         else:
             self.fog_end = self.z_far
             self.fog_start = self.fog_end - self.min_zfar * self.fog_range_scale
@@ -307,6 +324,8 @@ class GLCamera():
         self.fog_custom_range = bool(gl_parameters.get("fog_custom_range", False))
         self.fog_start_percent = float(gl_parameters.get("fog_start_percent", 50.0))
         self.fog_end_percent = float(gl_parameters.get("fog_end_percent", 100.0))
+        self.fog_start_reference = gl_parameters.get("fog_start_reference", "far_plane")
+        self.fog_center_offset = float(gl_parameters.get("fog_center_offset", 5.0))
         self.update_fog()
     
     def print_parms(self):
