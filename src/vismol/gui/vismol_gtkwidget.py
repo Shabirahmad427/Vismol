@@ -684,6 +684,23 @@ class VismolGTKWidget(_WidgetBase):
             set_tool ( self.vm_session, "delete" )
             dprint ( "Builder: tool = delete atom" )
 
+    def _pressed_Delete(self):
+        """ [EN] 2026-10-04, Builder: Delete removes the atoms of the
+        viewing selection that belong to the object being edited (one undo
+        step; click_mode.delete_selected_atoms()). Only while the Builder
+        is open; ignored while a text field of the window has the focus. """
+        if getattr ( self.vm_session, "builder_target_object", None ) is None:
+            return
+        main = getattr ( self.vm_session, "main", None )
+        window = getattr ( main, "window", None )
+        focus = window.get_focus ( ) if window is not None else None
+        if isinstance ( focus, ( Gtk.Editable, Gtk.TextView ) ):
+            return
+        from gui.windows.builder.click_mode import delete_selected_atoms
+        msg = delete_selected_atoms ( self.vm_session )
+        dprint ( "Builder: {}".format ( msg ) )
+        self.queue_draw ( )
+
     def _pressed_b(self):
         """ Builder: one-shot action -- adds a bond between the two
         atoms currently selected (shift-click two atoms first; see

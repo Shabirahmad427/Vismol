@@ -194,6 +194,12 @@ class VismolGLCore:
                                           char_width=_dist_font_size, char_height=_dist_font_size,
                                           color = [1, 1, 1, 1])
         self.vm_font_dist.zoom_sensitivity = _labels_zoom_sensitivity
+        # [EN] 2026-10-04: atom index labels of the Builder's DYFF Parameters
+        # window (builder_atom_types_labeled_atoms) -- same family, size and
+        # zoom sensitivity as the picking labels, its own (white) colour
+        self.vm_font_index  = VismolFont(font_file=_label_font_path, char_width=_label_font_size,
+                                          char_height=_label_font_size, color=[1, 1, 1, 1])
+        self.vm_font_index.zoom_sensitivity = _labels_zoom_sensitivity
         
         self.axis = GLAxis(vm_glcore = self)
         self.selection_box = SelectionBox()
@@ -1325,6 +1331,26 @@ class VismolGLCore:
             return True
         return False
     
+    def _print_hover_atom_info_idle(self, atom):
+        """ One-shot idle callback: prints the hovered atom's details, if
+        it is still the hovered atom (skips stale ones when the cursor kept
+        moving). """
+        if atom is getattr(self, "builder_hover_atom", None):
+            from gui.windows.builder import click_mode
+            click_mode.print_hover_atom_info(self, atom)
+        return False
+
+    def _hover_atom_callback_idle(self, atom):
+        """ One-shot idle callback: hands the hovered atom (or None) to
+        vm_session.hover_atom_callback, skipping stale ones. """
+        callback = getattr(self.vm_session, "hover_atom_callback", None)
+        if callback is not None and atom is getattr(self, "builder_hover_atom", None):
+            try:
+                callback(atom)
+            except Exception as error:
+                dprint("hover_atom_callback failed: {}".format(error))
+        return False
+
     def render(self, rotating = False):
         """ This is the function that will be called everytime the window
             needs to be re-drawed.
@@ -1487,6 +1513,20 @@ class VismolGLCore:
                 if hovered_atom is not None:
                     dprint ( "DEBUG click_mode: hovering atom #{} ('{}') of object '{}'".format (
                             hovered_atom.atom_id, hovered_atom.symbol, hovered_atom.vm_object.name ) )
+                    # [EN] 2026-10-03: atom details -> terminal (system, chain,
+                    # residue, element, name, DYFF type, FF type). Deferred to
+                    # idle so a (cached, but sometimes recomputed) DYFF typing
+                    # never stalls this frame.
+                    # 2026-10-04: disabled -- superseded by the main window's
+                    # hover statusbar (hover_atom_callback below).
+                    #from gi.repository import GLib
+                    #GLib.idle_add ( self._print_hover_atom_info_idle, hovered_atom )
+                # [EN] 2026-10-04: GUI hook (main window hover statusbar) --
+                # called on EVERY change, including None (cursor moved onto
+                # the background), so the GUI can clear its readout.
+                if getattr ( self.vm_session, "hover_atom_callback", None ) is not None:
+                    from gi.repository import GLib
+                    GLib.idle_add ( self._hover_atom_callback_idle, hovered_atom )
         # [EN] Builder "delete atom" tool -- unlike "add" (handled
         # entirely above via builder_placing_atom, no atom identification
         # needed), "delete" needs to know WHICH atom was clicked, so it
@@ -1779,13 +1819,25 @@ class VismolGLCore:
         # deixar apenas os labels"): no longer calls draw_hover_
         # highlight() here at all -- just the number, positioned via the
         # new, highlight-free click_mode.atom_world_position() instead.
+        #
+        # [EN] 2026-10-04 (user's request: the index labels were too large
+        # while editing parameters): drawn like the picking labels pk1-pk4
+        # (_draw_text_labels, atom.coords(frame)) with self.vm_font_index,
+        # so they follow the Preferences label font/size and ZOOM
+        # SENSITIVITY instead of draw_ring_label()'s constant on-screen size
+        # (kept for the bond-order ring, where a constant size is wanted).
         labeled_atoms = getattr(self.vm_session, "builder_atom_types_labeled_atoms", None)
         if labeled_atoms:
+            entries = []
             for labeled_atom in labeled_atoms:
                 if labeled_atom.vm_object.atoms.get(labeled_atom.atom_id) is not labeled_atom:
                     continue
-                world_center = click_mode.atom_world_position(labeled_atom)
-                click_mode.draw_ring_label(self, world_center, str(labeled_atom.atom_id))
+                text = str(labeled_atom.atom_id)
+                frame = self._get_vismol_object_frame(labeled_atom.vm_object)
+                # centred on the atom: glyph centres at i * spacing, i = 0..n-1
+                entries.append((text, labeled_atom.coords(frame), -(len(text) - 1) * 0.65 / 2.0))
+            if entries:
+                self._draw_text_labels(self.vm_font_index, entries, char_spacing=0.65)
 
         # Fecha o cronometro do frame e reporta periodicamente. Medimos so o
         # tempo de CPU/submissao (sem glFinish, que serializaria a GPU e
@@ -2720,7 +2772,7 @@ class VismolGLCore:
         if changed:
             GL.glUniform3fv(loc, 1, self.bckgrnd_color[:3])
     
-    def _draw_text_labels(self, vm_font, entries, string_shift=(0.0, 0.0)):
+    def _draw_text_labels(self, vm_font, entries, string_shift=(0.0, 0.0), char_spacing=1.0):
         """ [EN] Unified label/text drawing routine, shared by
             _draw_labels(), _draw_distance_labels(), _draw_picking_label()
             and representations.LabelRepresentation.draw_representation()
@@ -2774,6 +2826,10 @@ class VismolGLCore:
                                 atom it names). Use this instead of a
                                 per-entry x_shift when the nudge doesn't
                                 depend on the text itself.
+                char_spacing -- glyph advance as a fraction of the font's
+                                char width (1.0 = the default spacing;
+                                < 1 packs the glyphs, e.g. multi-digit
+                                atom indices).
 
             Returns the number of glyphs (GL_POINTS) drawn.
         """
@@ -2809,7 +2865,7 @@ class VismolGLCore:
                 uv_coords.append(cy * vm_font.text_v)
                 uv_coords.append((cx + 1) * vm_font.text_u)
                 uv_coords.append((cy + 1) * vm_font.text_v)
-                char_idx.append(float(i) + x_shift)
+                char_idx.append(float(i) * char_spacing + x_shift)
         
         chars = len(char_idx)
         if chars == 0:
