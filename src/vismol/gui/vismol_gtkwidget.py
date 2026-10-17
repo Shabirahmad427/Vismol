@@ -287,6 +287,8 @@ class VismolGTKWidget(_WidgetBase):
             # mask, GTK keeps delivering the plain UP/DOWN events every
             # mouse wheel and touchpad already works with today.
             self.set_events(self.get_events() | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        # trackpad points per discrete scroll step (see _mouse_scroll_smooth)
+        self._SMOOTH_SCROLL_POINTS_PER_STEP = 30.0
         self._scroll_remainder = 0.0
         self._scroll_modifiers = None
         # self.vm_objects_list_store = Gtk.ListStore(bool,  # visible? 
@@ -501,6 +503,14 @@ class VismolGTKWidget(_WidgetBase):
             return
         if not valid or delta_y is None or not np.isfinite(delta_y) or delta_y == 0:
             return
+
+        # [EN] GTK3/Quartz reports trackpad scrolling in POINTS (measured
+        # |delta_y| of 1..~20 per event, accelerating during a swipe), not
+        # in wheel notches. Treating each point as one notch applied up to
+        # ~20 slab-widening ticks (x e^0.138 each) per event, so a short
+        # swipe pushed z_far to ~1e20, clipped the molecule away and
+        # overflowed the float32 fog/projection uniforms.
+        delta_y = delta_y / self._SMOOTH_SCROLL_POINTS_PER_STEP
 
         state = event.state
         ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
