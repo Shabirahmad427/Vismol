@@ -45,16 +45,7 @@ layout(std140) uniform CameraMatrices {
     mat4 proj_mat;
 };
 
-struct Light {
-   vec3 position;
-   //vec3 color;
-   vec3 intensity;
-   //vec3 specular_color;
-   float ambient_coef;
-   float shininess;
-};
-
-uniform Light my_light;
+#include <vm_lighting>
 
 uniform mat4 model_mat;
 
@@ -93,22 +84,7 @@ in vec4 frag_coord;       // varying vec4 v_eye_position;
 out vec4 final_color;
 
 vec4 calculate_color(vec3 fnrm, vec3 fcrd, vec3 fcol){
-    vec3 normal = normalize(fnrm);
-    vec3 vert_to_light = normalize(my_light.position);
-    vec3 vert_to_cam = normalize(fcrd);
-    // Ambient Component
-    vec3 ambient = my_light.ambient_coef * fcol * my_light.intensity;
-    // Diffuse component
-    float diffuse_coef = max(0.0, dot(normal, vert_to_light));
-    vec3 diffuse = diffuse_coef * fcol * my_light.intensity;
-    // Specular component
-    float specular_coef = 0.0;
-    if (diffuse_coef > 0.0)
-        specular_coef = pow(max(0.0, dot(vert_to_cam, reflect(vert_to_light, normal))), my_light.shininess);
-    vec3 specular = specular_coef * my_light.intensity;
-    specular = specular * (vec3(1) - diffuse);
-    vec4 out_color = vec4(ambient + diffuse + specular, 1.0);
-    return out_color;
+    return vec4(vm_lighting(normalize(fnrm), normalize(fcrd), fcol, 0.0), 1.0);
 }
 
 void main(){
@@ -402,16 +378,7 @@ layout(std140) uniform CameraMatrices {
 #extension GL_EXT_frag_depth: enable
 precision highp float;
 
-struct Light {
-    vec3 position;
-    //vec3 color;
-    vec3 intensity;
-    //vec3 specular_color;
-    float ambient_coef;
-    float shininess;
-};
-
-uniform Light my_light;
+#include <vm_lighting>
 
 //uniform float u_depth;
 
@@ -444,14 +411,7 @@ void main() {
     if (dist_to_sph < 0.0) discard;
     vec3 coord_on_sph = ray_orig + ray_dir * dist_to_sph;
     vec3 normal = normalize(coord_on_sph - frag_center);
-    vec3 vert_to_light = normalize(my_light.position - coord_on_sph);
-    
-    // Ambient Component
-    vec3 ambient = my_light.ambient_coef * frag_color * my_light.intensity;
-    
-    // Diffuse component
-    float diffuse_coef = max(0.0, dot(normal, vert_to_light));
-    vec3 diffuse = diffuse_coef * frag_color * my_light.intensity;
+    vec4 lit_color = vec4(vm_lighting(normal, ray_dir, frag_color, 0.0), 1.0);
     //final_color = vec4(ambient + diffuse, 1.0);
     
     //vec4 depth = proj_mat * vec4(frag_center + normal * frag_radius, 1.0);
@@ -462,10 +422,10 @@ void main() {
     float dist = abs(depth.z);
     if(dist>=fog_start){
         float fog_factor = 1.0 - fog_intensity * (1.0 - clamp((fog_end-dist)/(fog_end-fog_start), 0.0, 1.0));
-        final_color = mix(fog_color, vec4(ambient + diffuse, 1.0), fog_factor);
+        final_color = mix(fog_color, lit_color, fog_factor);
     }
     else{
-       final_color = vec4(ambient + diffuse, 1.0);
+       final_color = lit_color;
     }
 }
 """

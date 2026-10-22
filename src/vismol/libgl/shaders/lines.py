@@ -188,6 +188,121 @@ void main() {
 """
 
 
+#------------------------------------------------------------------------------
+#  Multiple bonds for the "lines" representation (2026-10-14).
+#
+#  Drawn in a second pass (LinesRepresentation, program "lines_multi") with
+#  GL_LINES_ADJACENCY: each double/triple bond arrives as 4 vertices
+#  (ref, i, j, j), where ref is a neighbour atom that tells on which side of
+#  the bond the extra line goes (the inside of the ring for ring bonds). The
+#  first pass ("lines") draws only the single bonds.
+#
+#  u_mode 0: double bond in a ring  -> axis line + shorter inner line on the ref side
+#  u_mode 1: double bond, no ring   -> two full lines at +-sep/2
+#  u_mode 2: triple bond            -> axis line + two lines at +-sep
+#
+#  Double bonds are offset in 3D, in the plane of the bond and ref (the ring or
+#  substituent plane), so a ring seen edge-on looks flat; triple bonds and
+#  doubles without substituents (ref == j) are offset perpendicular to the
+#  bond on the screen. Picking is unaffected (lines_sel draws one line per bond).
+#------------------------------------------------------------------------------
+vertex_shader_lines_multi = """
+#version 330 core
+
+layout(std140) uniform CameraMatrices {
+    mat4 view_mat;
+    mat4 proj_mat;
+};
+uniform mat4 model_mat;
+
+in vec3 vert_coord;
+in vec3 vert_color;
+
+out vec3 geom_color;
+out vec4 geom_coord;
+
+void main() {
+    geom_coord  = view_mat * model_mat * vec4(vert_coord, 1.0);
+    geom_color  = vert_color;
+    gl_Position = geom_coord;
+}
+"""
+
+geometry_shader_lines_multi = """
+#version 330 core
+
+layout(std140) uniform CameraMatrices {
+    mat4 view_mat;
+    mat4 proj_mat;
+};
+
+layout (lines_adjacency) in;
+layout (line_strip, max_vertices = 12) out;
+
+uniform int   u_mode;        // 0 ring double, 1 double, 2 triple
+uniform float u_separation;  // Angstrom (view space)
+uniform float u_shrink;      // fraction cut from each end of the inner ring line
+
+in vec3 geom_color[];
+in vec4 geom_coord[];
+
+out vec3 frag_color;
+out vec4 frag_coord;
+
+void emit_split(vec3 a, vec3 b) {
+    // one line a-b, first half in the color of atom i, second in that of j
+    vec3 m = (a + b) * 0.5;
+    frag_color = geom_color[1]; frag_coord = vec4(a, 1.0); gl_Position = proj_mat * frag_coord; EmitVertex();
+    frag_color = geom_color[1]; frag_coord = vec4(m, 1.0); gl_Position = proj_mat * frag_coord; EmitVertex();
+    EndPrimitive();
+    frag_color = geom_color[2]; frag_coord = vec4(m, 1.0); gl_Position = proj_mat * frag_coord; EmitVertex();
+    frag_color = geom_color[2]; frag_coord = vec4(b, 1.0); gl_Position = proj_mat * frag_coord; EmitVertex();
+    EndPrimitive();
+}
+
+void main() {
+    vec3 pr = geom_coord[0].xyz;
+    vec3 p0 = geom_coord[1].xyz;
+    vec3 p1 = geom_coord[2].xyz;
+    vec3 bond = p1 - p0;
+
+    // Offset direction. With a reference atom (ring neighbour, or a
+    // substituent of a non-ring double bond): in 3D, perpendicular to the bond
+    // in the plane bond/ref, as in the molecule itself -- seen edge-on the lines
+    // overlap instead of opening up on the screen. Without one (triple bonds,
+    // ref == j): perpendicular to the bond on the screen.
+    vec3 side = vec3(0.0);
+    vec3 axis = normalize(bond);
+    vec3 r = pr - p0;
+    vec3 perp = r - dot(r, axis) * axis;
+    if (u_mode != 2 && length(perp) > 1e-3) {
+        side = normalize(perp);
+    } else {
+        vec2 a2 = bond.xy;
+        if (length(a2) > 1e-6) {
+            a2 = normalize(a2);
+            side = vec3(-a2.y, a2.x, 0.0);
+        }
+    }
+
+    if (u_mode == 0) {
+        emit_split(p0, p1);
+        vec3 off = side * u_separation;
+        emit_split(p0 + off + bond * u_shrink, p1 + off - bond * u_shrink);
+    } else if (u_mode == 1) {
+        vec3 off = side * (0.5 * u_separation);
+        emit_split(p0 + off, p1 + off);
+        emit_split(p0 - off, p1 - off);
+    } else {
+        vec3 off = side * u_separation;
+        emit_split(p0, p1);
+        emit_split(p0 + off, p1 + off);
+        emit_split(p0 - off, p1 - off);
+    }
+}
+"""
+
+
 
 
 
@@ -1124,16 +1239,7 @@ fragment_shader_sticks = """
 precision highp float; 
 precision highp int;
 
-struct Light {
-   vec3 position;
-   //vec3 color;
-   vec3 intensity;
-   //vec3 specular_color;
-   float ambient_coef;
-   float shininess;
-};
-
-uniform Light my_light;
+#include <vm_lighting>
 
 uniform vec4 fog_color;
 uniform float fog_start;
@@ -1148,23 +1254,7 @@ out vec4 final_color;
 
 void main(){
     vec3 normal = normalize(frag_norm);
-    vec3 vert_to_light = normalize(my_light.position);
-    vec3 vert_to_cam = normalize(frag_coord);
-    
-    // Ambient Component
-    vec3 ambient = my_light.ambient_coef * frag_color * my_light.intensity;
-    
-    // Diffuse component
-    float diffuse_coef = max(0.0, dot(normal, vert_to_light));
-    vec3 diffuse = diffuse_coef * frag_color * my_light.intensity;
-    
-    // Specular component
-    float specular_coef = 0.0;
-    if (diffuse_coef > 0.0)
-        specular_coef = pow(max(0.0, dot(vert_to_cam, reflect(vert_to_light, normal))), my_light.shininess);
-    vec3 specular = specular_coef * my_light.intensity;
-    specular = specular * (vec3(1) - diffuse);
-    vec4 my_color = vec4(ambient + diffuse + specular, 1.0);
+    vec4 my_color = vec4(vm_lighting(normal, normalize(frag_coord), frag_color, 0.0), 1.0);
     
     float dist = abs(frag_coord.z);
     if(dist>=fog_start){

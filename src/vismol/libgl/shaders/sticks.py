@@ -9,6 +9,9 @@ só o multiplicador de afinamento das múltiplas (o 0.6).
 
 Então: para mudar a espessura geral, ajuste sticks_radius/self.radius; 
 para mudar só as múltiplas em relação às simples, ajuste o 0.6 no shader.
+[2026-10-14] Superado: a tripla agora e' eixo + dois cilindros lado a lado
+(como em lines) e as duplas ficam no plano do anel/substituintes
+(u_bond_side_tbo). O texto abaixo descreve a versao anterior.
 Tripla triangular: aplicado. Em vez de três tubos numa linha, 
 agora os três ficam nos vértices de um triângulo equilátero, 
 no plano perpendicular à ligação. Para isso criei um segundo 
@@ -120,6 +123,16 @@ layout (triangle_strip, max_vertices = 40) out;
 // entre cilindros de uma mesma ligacao. Setados por draw_representation.
 uniform int u_pass;
 uniform float u_separation;
+// [EN] 2026-10-15: radius of each cylinder and spacing of double and triple
+// bonds, in Angstrom (Preferences, shared by sticks and dynamic bonds; the
+// single-bond radius is vert_rad). Spacing: double = distance between the two
+// cylinder axes, triple = distance from the bond axis to each cylinder (radius
+// of the triangle). <= 0: fall back to the old rules (0.4 x vert_rad,
+// u_separation).
+uniform float u_rad_double;
+uniform float u_rad_triple;
+uniform float u_sep_double;
+uniform float u_sep_triple;
 
 // [ATUALIZACAO] Ordem da ligacao lida por PRIMITIVA (nao mais por vertice).
 // u_bond_order_tbo e uma Buffer Texture (GL_TEXTURE_BUFFER, formato R32UI)
@@ -139,6 +152,15 @@ uniform float u_separation;
 // compiled with PICKING_PASS defined, which removes the sampler entirely.
 #ifndef PICKING_PASS
 uniform usamplerBuffer u_bond_order_tbo;
+// [EN] 2026-10-14: plane of the double bonds (same style as "lines"). One
+// RGBA32F texel per bond: xyz = unit vector perpendicular to the bond in the
+// ring / substituent plane (object space), w = 0 ring double (axis cylinder +
+// shorter inner cylinder), 1 double in the substituent plane, 2 offset on the
+// screen (triple bonds, no substituent). u_has_side = 0: no texture bound,
+// every bond uses the screen.
+uniform samplerBuffer u_bond_side_tbo;
+uniform int u_has_side;
+uniform mat4 model_mat;
 #endif
 
 in vec3 geom_color[];
@@ -575,32 +597,59 @@ void main(){
         g_side_dir = ort_vec;
     }
     g_side_dir = normalize(g_side_dir);
-    // Segundo vetor perpendicular, ortogonal ao eixo e a g_side_dir. Junto com
-    // g_side_dir forma o plano da secao transversal da ligacao, usado para
-    // posicionar os cilindros (triangulo na ligacao tripla).
-    vec3 g_up_dir = normalize(cross(normalize(vec_p0_p1), g_side_dir));
+    // [EN] 2026-10-14: double bonds in the plane of the ring / substituents
+    // (u_bond_side_tbo, see above); otherwise g_side_dir (screen).
+    float side_mode = 2.0;
+#ifndef PICKING_PASS
+    if (order > 1 && u_has_side == 1) {
+        vec4 s = texelFetch(u_bond_side_tbo, gl_PrimitiveIDIn);
+        if (s.w < 1.5 || s.w > 2.5) {
+            vec3 axis_v = normalize(vec_p0_p1);
+            vec3 plane = mat3(view_mat * model_mat) * s.xyz;
+            plane = plane - dot(plane, axis_v) * axis_v;
+            if (length(plane) > 1e-4) {
+                g_side_dir = normalize(plane);
+                side_mode = s.w;
+            }
+        }
+    }
+#endif
 
-    // Offset 2D no plano perpendicular, conforme a ordem e a passada.
+    // Offset no plano perpendicular, conforme a ordem e a passada.
+    //   double (ring or not): two thin cylinders of full length at +-sep/2, in
+    //     the ring / substituent plane (2026-10-15, user: the axis cylinder +
+    //     shorter inner cylinder used for ring doubles looked worse in sticks
+    //     than the old symmetric pair -- "lines" keeps the inner line);
+    //   triple: three thin cylinders on a triangle fixed to the molecule
+    //     (u_bond_side_tbo w = 3); without that data, axis + two at +-sep.
     vec3 off = vec3(0.0);
+    float shrink = 0.0;
+    eff_rad = geom_rad[0];
     if (order == 2) {
-        // Dois cilindros lado a lado: -sep/2 e +sep/2 ao longo de g_side_dir.
-        float d = (u_pass == 0) ? (-u_separation * 0.5) : (u_separation * 0.5);
+        float sep2 = (u_sep_double > 0.0) ? u_sep_double : u_separation;
+        float d = (u_pass == 0) ? (-sep2 * 0.5) : (sep2 * 0.5);
         off = g_side_dir * d;
+        eff_rad = (u_rad_double > 0.0) ? u_rad_double : geom_rad[0] * 0.4;
     } else if (order == 3) {
-        // Tres cilindros nos vertices de um triangulo equilatero, no plano
-        // perpendicular. Cada passada ocupa um vertice (angulos 90, 210, 330
-        // graus), com raio 'u_separation' a partir do centro do eixo.
-        float ang = radians(90.0 + 120.0 * float(u_pass));
-        off = (g_side_dir * cos(ang) + g_up_dir * sin(ang)) * u_separation;
+        float sep3 = (u_sep_triple > 0.0) ? u_sep_triple : u_separation;
+        if (side_mode > 2.5) {
+            // [EN] 2026-10-15: triangle fixed to the molecule (w = 3): the three
+            // cylinders at 90/210/330 degrees in the plane perpendicular to the
+            // bond, starting from the object-space vector of u_bond_side_tbo,
+            // so the triangle turns with the molecule like the double bonds.
+            vec3 up_dir = normalize(cross(normalize(vec_p0_p1), g_side_dir));
+            float ang = radians(90.0 + 120.0 * float(u_pass));
+            off = (g_side_dir * cos(ang) + up_dir * sin(ang)) * sep3;
+        } else {
+            if (u_pass == 1) off = g_side_dir * sep3;
+            if (u_pass == 2) off = -g_side_dir * sep3;
+        }
+        eff_rad = (u_rad_triple > 0.0) ? u_rad_triple : geom_rad[0] * 0.4;
     }
 
-    center0 = geom_coord[0].xyz + off;
-    center1 = geom_coord[1].xyz + off;
+    center0 = geom_coord[0].xyz + off + vec_p0_p1 * shrink;
+    center1 = geom_coord[1].xyz + off - vec_p0_p1 * shrink;
     mid_c = (center0 + center1) * 0.5;
-    // Afinamento: ligacoes multiplas usam cilindros mais finos; simples mantem
-    // o raio cheio. Ajuste o fator 0.6 a gosto (menor = mais fino).
-    eff_rad = (order > 1) ? (geom_rad[0] * 0.4) : geom_rad[0];
-    //eff_rad = (order > 1) ? (geom_rad[0] * 0.6) : geom_rad[0];
     emit_cylinder();
 }
 """
@@ -610,16 +659,7 @@ fragment_shader_sticks = """
 precision highp float; 
 precision highp int;
 
-struct Light {
-   vec3 position;
-   //vec3 color;
-   vec3 intensity;
-   //vec3 specular_color;
-   float ambient_coef;
-   float shininess;
-};
-
-uniform Light my_light;
+#include <vm_lighting>
 
 uniform vec4 fog_color;
 uniform float fog_start;
@@ -633,22 +673,7 @@ in vec3 frag_norm;
 out vec4 final_color;
 
 vec4 calculate_color(vec3 fnrm, vec3 fcrd, vec3 fcol){
-    vec3 normal = normalize(fnrm);
-    vec3 vert_to_light = normalize(my_light.position);
-    vec3 vert_to_cam = normalize(fcrd);
-    // Ambient Component
-    vec3 ambient = my_light.ambient_coef * fcol * my_light.intensity;
-    // Diffuse component
-    float diffuse_coef = max(0.0, dot(normal, vert_to_light));
-    vec3 diffuse = diffuse_coef * fcol * my_light.intensity;
-    // Specular component
-    float specular_coef = 0.0;
-    if (diffuse_coef > 0.0)
-        specular_coef = pow(max(0.0, dot(vert_to_cam, reflect(vert_to_light, normal))), my_light.shininess);
-    vec3 specular = specular_coef * my_light.intensity;
-    specular = specular * (vec3(1) - diffuse);
-    vec4 out_color = vec4(ambient + diffuse + specular, 1.0);
-    return out_color;
+    return vec4(vm_lighting(normalize(fnrm), normalize(fcrd), fcol, 0.0), 1.0);
 }
 
 void main(){
@@ -925,16 +950,7 @@ layout(std140) uniform CameraMatrices {
 #extension GL_EXT_frag_depth: enable
 precision highp float;
 
-struct Light {
-    vec3 position;
-    //vec3 color;
-    vec3 intensity;
-    //vec3 specular_color;
-    float ambient_coef;
-    float shininess;
-};
-
-uniform Light my_light;
+#include <vm_lighting>
 
 //uniform float u_depth;
 
@@ -988,22 +1004,7 @@ float caps_intersect( in vec3 ro, in vec3 rd, in vec3 pa, in vec3 pb, in float r
 }
 
 vec4 calculate_color(vec3 fnrm, vec3 fcrd, vec3 fcol){
-    vec3 normal = normalize(fnrm);
-    vec3 vert_to_light = normalize(my_light.position);
-    vec3 vert_to_cam = normalize(fcrd);
-    // Ambient Component
-    vec3 ambient = my_light.ambient_coef * fcol * my_light.intensity;
-    // Diffuse component
-    float diffuse_coef = max(0.0, dot(normal, vert_to_light));
-    vec3 diffuse = diffuse_coef * fcol * my_light.intensity;
-    // Specular component
-    float specular_coef = 0.0;
-    if (diffuse_coef > 0.0)
-        specular_coef = pow(max(0.0, dot(vert_to_cam, reflect(vert_to_light, normal))), my_light.shininess);
-    vec3 specular = specular_coef * my_light.intensity;
-    specular = specular * (vec3(1) - diffuse);
-    vec4 out_color = vec4(ambient + diffuse + specular, 1.0);
-    return out_color;
+    return vec4(vm_lighting(normalize(fnrm), normalize(fcrd), fcol, 0.0), 1.0);
 }
 
 void main() {

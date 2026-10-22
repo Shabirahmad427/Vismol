@@ -887,10 +887,10 @@ class VismolObject:
             self.covalent_bonds = cov
             self.metal_bonds = met
             if len(met):
-                logger.info("Ligacoes metalicas detectadas: %d", len(met) // 2)
+                logger.info("Metal bonds detected: %d", len(met) // 2)
         except Exception as e:
-            logger.warning("Deteccao de ligacoes metalicas falhou (%s); "
-                           "tratando todas como covalentes." % e)
+            logger.warning("Metal bond detection failed (%s); "
+                           "treating all bonds as covalent." % e)
             self.covalent_bonds = self.index_bonds
             self.metal_bonds = np.array([], dtype=np.uint32)
 
@@ -919,16 +919,16 @@ class VismolObject:
                 try:
                     from bond_order_perception import perceive_for_vismol
                 except Exception as e:
-                    logger.warning("bond_order_perception indisponivel (%s); "
-                                   "mantendo ordens atuais." % e)
+                    logger.warning("bond_order_perception not available (%s); "
+                                   "keeping the current orders." % e)
                     return
         try:
             symbols = [self.atoms[i].symbol for i in range(len(self.atoms))]
             orders = perceive_for_vismol(symbols, self.index_bonds)
             self.bond_order_list = np.array(orders, dtype=np.uint32)
         except Exception as e:
-            logger.warning("Falha na percepcao de ordem de ligacao (%s); "
-                           "mantendo ordens atuais." % e)
+            logger.warning("Bond order perception failed (%s); "
+                           "keeping the current orders." % e)
 
     def _build_bond_order_per_atom(self):
         """
@@ -1065,9 +1065,9 @@ class VismolObject:
                 try:
                     from bond_order_perception import perceive_bond_order_for_pairs_pure
                 except Exception as e:
-                    logger.warning("bond_order_perception (casamento maximo) "
-                                   "indisponivel (%s); usando fallback guloso "
-                                   "local." % e)
+                    logger.warning("bond_order_perception (maximum matching) "
+                                   "not available (%s); using the local greedy "
+                                   "fallback." % e)
                     return self._perceive_bond_order_for_pairs_greedy_fallback(
                         ib, symbols, extra_degree)
 
@@ -1325,6 +1325,17 @@ class VismolObject:
         # separately.
         if external_orders is None:
             computed_orders = self.perceive_bond_order_for_pairs(self.index_bonds)
+            # [EN] 2026-10-15: residues WITHOUT hydrogens (raw PDB files) --
+            # the valence heuristic above assumes every H is present and puts
+            # spurious double bonds there. Standard residues get their
+            # template, other residues EasyHybrid's native perception (from
+            # the heavy-atom geometry); see residue_bond_orders.py.
+            try:
+                from vismol.core.residue_bond_orders import residue_aware_orders
+                computed_orders = residue_aware_orders(self.atoms, self.index_bonds, computed_orders,
+                                                       self.frames[0])
+            except Exception as e:
+                logger.warning("residue-aware bond orders failed (%s); valence orders kept" % e)
             self.bond_order_list = computed_orders.tolist()
             #print(len(self.bond_order_list))
             #print(self.bond_order_list)

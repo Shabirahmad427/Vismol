@@ -667,17 +667,287 @@ class DotsRepresentation(Representation):
         GL.glUseProgram(0)
 
 
+LINES_MULTI_RING_DOUBLE = 0   # u_mode of the "lines_multi" geometry shader
+LINES_MULTI_DOUBLE      = 1
+LINES_MULTI_TRIPLE      = 2
+
+
+def multiple_bond_references(pairs, orders, all_pairs, is_hydrogen=None, max_ring=8):
+    """ Drawing mode and reference atom of each bond, for the double/triple
+        bonds of "lines" and "sticks" (2026-10-14).
+
+        pairs       (n, 2) bonds drawn by the representation
+        orders      (n,)   bond orders (1, 2, 3; others are clamped)
+        all_pairs   (m, 2) every bond of the object (neighbours, rings)
+        is_hydrogen optional callable(atom index) -> bool
+
+        Returns (mode, ref), int64 arrays of length n. mode: -1 single,
+        LINES_MULTI_RING_DOUBLE, LINES_MULTI_DOUBLE or LINES_MULTI_TRIPLE.
+        ref: for a double bond in a ring of up to max_ring atoms, the
+        neighbour of i on the smallest ring (the inner line/cylinder goes on
+        its side); for another double bond, a substituent of i or j, heavy
+        atoms first (it fixes the plane of the two lines); -1 otherwise
+        (triple bonds, no substituent: offset on the screen). """
+    pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+    orders = np.clip(np.asarray(orders, dtype=np.int64).ravel(), 1, 3)
+    mode = np.full(pairs.shape[0], -1, dtype=np.int64)
+    ref = np.full(pairs.shape[0], -1, dtype=np.int64)
+    mode[orders >= 3] = LINES_MULTI_TRIPLE
+    doubles = np.flatnonzero(orders == 2)
+    if doubles.size == 0:
+        return mode, ref
+    # . neighbour lists (CSR) of the whole object
+    allp = np.asarray(all_pairs, dtype=np.int64).reshape(-1, 2)
+    n_atoms = int(max(allp.max(initial=-1), pairs.max(initial=-1))) + 1
+    a = np.concatenate([allp[:, 0], allp[:, 1]])
+    b = np.concatenate([allp[:, 1], allp[:, 0]])
+    srt = np.argsort(a, kind="stable")
+    a, b = a[srt], b[srt]
+    starts = np.searchsorted(a, np.arange(n_atoms + 1))
+    def neighbours(i):
+        return b[starts[i]:starts[i + 1]]
+
+    def ring_neighbour(i, j):
+        """ First atom after i on the shortest path i -> j that avoids the bond i-j. """
+        first = {}
+        frontier = []
+        for k in neighbours(i):
+            k = int(k)
+            if k == j or k in first:
+                continue
+            first[k] = k
+            frontier.append(k)
+        candidates = []
+        for _ in range(max_ring - 2):
+            nxt = []
+            for x in frontier:
+                for y in neighbours(x):
+                    y = int(y)
+                    if y == j:
+                        candidates.append(first[x])
+                    elif y != i and y not in first:
+                        first[y] = first[x]
+                        nxt.append(y)
+            if candidates:
+                # . several rings of the same size (fused systems): prefer a heavy atom
+                if is_hydrogen is not None:
+                    heavy = [k for k in candidates if not is_hydrogen(k)]
+                    if heavy:
+                        return heavy[0]
+                return candidates[0]
+            frontier = nxt
+        return None
+
+    for n in doubles:
+        i, j = int(pairs[n, 0]), int(pairs[n, 1])
+        k = ring_neighbour(i, j)
+        if k is not None:
+            mode[n], ref[n] = LINES_MULTI_RING_DOUBLE, k
+            continue
+        # . substituent plane (only the component of ref perpendicular to the
+        #   bond is used, so a substituent of j gives the same plane)
+        mode[n] = LINES_MULTI_DOUBLE
+        subs = [int(x) for x in neighbours(i) if int(x) != j] + [int(x) for x in neighbours(j) if int(x) != i]
+        if subs and is_hydrogen is not None:
+            subs.sort(key=lambda s: bool(is_hydrogen(s)))
+        if subs:
+            ref[n] = subs[0]
+    return mode, ref
+
+
+def multiple_bond_split(pairs, orders, all_pairs, is_hydrogen=None, max_ring=8):
+    """ Splits the bonds of a "lines" representation into single bonds and
+        double/triple bonds (see multiple_bond_references).
+
+        Returns (singles, groups): singles is the flat uint32 array of the
+        single bonds (GL_LINES); groups maps LINES_MULTI_* to a flat uint32
+        array of 4 indexes per bond (ref, i, j, j) for GL_LINES_ADJACENCY
+        (ref == j when there is no reference atom). """
+    pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+    mode, ref = multiple_bond_references(pairs, orders, all_pairs, is_hydrogen, max_ring)
+    singles = np.ascontiguousarray(pairs[mode < 0].ravel(), dtype=np.uint32)
+    groups = {}
+    for m in (LINES_MULTI_RING_DOUBLE, LINES_MULTI_DOUBLE, LINES_MULTI_TRIPLE):
+        sel = np.flatnonzero(mode == m)
+        if sel.size:
+            r = np.where(ref[sel] >= 0, ref[sel], pairs[sel, 1])
+            groups[m] = np.ascontiguousarray(np.stack([r, pairs[sel, 0], pairs[sel, 1], pairs[sel, 1]], axis=1).ravel(),
+                                             dtype=np.uint32)
+    return singles, groups
+
+
+STICKS_TRIPLE_TRIANGLE = 3     # w of u_bond_side_tbo: triple bond as a triangle fixed to the molecule
+
+
+def multiple_bond_sides(pairs, mode, ref, coords):
+    """ Per-bond float32 (n, 4) array for the sticks geometry shader
+        (u_bond_side_tbo), xyz in object space:
+          double bonds: unit vector perpendicular to the bond in the plane
+              bond/ref, w = mode (LINES_MULTI_RING_DOUBLE / LINES_MULTI_DOUBLE);
+          triple bonds: a unit vector perpendicular to the bond (cross with the
+              Cartesian axis least aligned with it), w = STICKS_TRIPLE_TRIANGLE:
+              the three cylinders sit on a triangle that turns with the
+              molecule, like the plane of the double bonds;
+          anything else (single, no reference atom, reference collinear with
+              the bond): w = 2, offset on the screen. """
+    pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+    out = np.zeros((pairs.shape[0], 4), dtype=np.float32)
+    out[:, 3] = LINES_MULTI_TRIPLE
+    xyz = np.asarray(coords, dtype=np.float64)
+    tri = np.flatnonzero(mode == LINES_MULTI_TRIPLE)
+    if tri.size:
+        axis = xyz[pairs[tri, 1]] - xyz[pairs[tri, 0]]
+        axis /= np.maximum(np.linalg.norm(axis, axis=1), 1e-9)[:, None]
+        helper = np.eye(3)[np.argmin(np.abs(axis), axis=1)]
+        perp = np.cross(axis, helper)
+        norm = np.linalg.norm(perp, axis=1)
+        ok = norm > 1e-6
+        out[tri[ok], :3] = perp[ok] / norm[ok][:, None]
+        out[tri[ok], 3] = STICKS_TRIPLE_TRIANGLE
+    sel = np.flatnonzero(((mode == LINES_MULTI_RING_DOUBLE) | (mode == LINES_MULTI_DOUBLE)) & (ref >= 0))
+    if sel.size == 0:
+        return out
+    p0 = xyz[pairs[sel, 0]]
+    axis = xyz[pairs[sel, 1]] - p0
+    axis /= np.maximum(np.linalg.norm(axis, axis=1), 1e-9)[:, None]
+    r = xyz[ref[sel]] - p0
+    perp = r - np.sum(r * axis, axis=1)[:, None] * axis
+    norm = np.linalg.norm(perp, axis=1)
+    ok = norm > 1e-3
+    out[sel[ok], :3] = perp[ok] / norm[ok][:, None]
+    out[sel[ok], 3] = mode[sel[ok]]
+    return out
+
+
+def _hydrogen_test(vm_object):
+    """ callable(atom index) -> True for hydrogens of vm_object (reference-atom choice). """
+    atoms = getattr(vm_object, "atoms", None) or {}
+    def is_hydrogen(i):
+        atom = atoms.get(i)
+        return atom is not None and str(getattr(atom, "symbol", "")).upper() == "H"
+    return is_hydrogen
+
+
 class LinesRepresentation(Representation):
     """ Class doc """
-    
+
     def __init__(self, vismol_object, vismol_glcore, indexes, active=True):
         """ Class initialiser """
         super(LinesRepresentation, self).__init__(vismol_object, vismol_glcore, "lines", active, indexes)
-        
+
         #self.elements = np.uint32(self.indexes.shape[0])
         self.size_vbo  =  None
         self.ratio_vbo =  None
         #print(self.vm_object.cov_radii_array)
+        # . double/triple bonds (2026-10-14): ind_vbo holds only the single
+        #   bonds; the multiple ones go to multi_vao (program "lines_multi",
+        #   GL_LINES_ADJACENCY). The selection pass still draws self.indexes.
+        self.multi_vao = None
+        self.multi_ind_vbo = None
+        self._multi_key = None
+        self._n_single_elems = int(self.elements)
+        self._multi_ranges = []     # [(mode, byte offset, n elements)]
+
+    def _make_gl_representation_vao_and_vbos(self):
+        """ Base VAO plus the VAO of the multiple-bond pass, which shares the
+            coordinate and color buffers. """
+        super(LinesRepresentation, self)._make_gl_representation_vao_and_vbos()
+        program = self.vm_glcore.shader_programs.get("lines_multi")
+        if program is None:
+            return
+        self.multi_vao = self._make_gl_vao()
+        self.multi_ind_vbo = self._make_gl_index_buffer(np.zeros(4, dtype=np.uint32))
+        for vbo, name in ((self.coord_vbo, "vert_coord"), (self.col_vbo, "vert_color")):
+            att = GL.glGetAttribLocation(program, name)
+            if att == -1:
+                continue
+            GL.glBindBuffer(GL.GL_ARRAY_BUFFER, vbo)
+            GL.glEnableVertexAttribArray(att)
+            GL.glVertexAttribPointer(att, 3, GL.GL_FLOAT, GL.GL_FALSE, 12, ctypes.c_void_p(0))
+        GL.glBindVertexArray(0)
+        self._multi_key = None
+
+    def _bond_orders(self):
+        """ Order of each pair of self.indexes (1 when multiple_bonds is off). """
+        n_bonds = int(self.indexes.shape[0] // 2)
+        orders = np.ones(n_bonds, dtype=np.int64)
+        try:
+            if not self.vm_session.vm_config.gl_parameters.get("multiple_bonds", True):
+                return orders
+        except Exception:
+            pass
+        get_bond = getattr(self.vm_object, "get_bond", None)
+        if get_bond is None or n_bonds == 0:
+            return orders
+        ib = self.indexes
+        for k in range(n_bonds):
+            bond = get_bond(int(ib[2 * k]), int(ib[2 * k + 1]))
+            if bond is not None:
+                orders[k] = int(bond.bond_order)
+        return orders
+
+    def _update_multiple_bonds(self):
+        """ Re-splits single/multiple bonds when the drawn pairs, the bonds of
+            the object or the multiple_bonds flag change (a Builder edit of a
+            bond order recreates the representation). Call with self.vao bound. """
+        try:
+            mb_on = bool(self.vm_session.vm_config.gl_parameters.get("multiple_bonds", True))
+        except Exception:
+            mb_on = True
+        key = (id(self.indexes), int(self.indexes.shape[0]), id(getattr(self.vm_object, "bonds", None)),
+               id(getattr(self.vm_object, "bond_order_list", None)), mb_on, self.multi_vao is not None)
+        if key == self._multi_key:
+            return
+        self._multi_key = key
+        if self.multi_vao is None or self.indexes.shape[0] == 0:
+            self._n_single_elems = int(self.elements)
+            self._multi_ranges = []
+            return
+        orders = self._bond_orders()
+        if not (orders >= 2).any():
+            singles, groups = self.indexes, {}
+        else:
+            all_pairs = getattr(self.vm_object, "index_bonds", None)
+            if all_pairs is None or len(all_pairs) == 0:
+                all_pairs = self.indexes
+            singles, groups = multiple_bond_split(self.indexes, orders, all_pairs, _hydrogen_test(self.vm_object))
+        singles = np.ascontiguousarray(singles, dtype=np.uint32)
+        # . self.vao is bound: this element buffer is the one the first pass draws
+        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self.ind_vbo)
+        GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, singles.nbytes, singles, GL.GL_DYNAMIC_DRAW)
+        self._n_single_elems = int(singles.shape[0])
+        self._multi_ranges = []
+        if groups:
+            flat = np.ascontiguousarray(np.concatenate([groups[m] for m in sorted(groups)]), dtype=np.uint32)
+            offset = 0
+            for m in sorted(groups):
+                n = int(groups[m].shape[0])
+                self._multi_ranges.append((m, offset * 4, n))
+                offset += n
+            GL.glBindVertexArray(self.multi_vao)
+            GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self.multi_ind_vbo)
+            GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, flat.nbytes, flat, GL.GL_DYNAMIC_DRAW)
+            GL.glBindVertexArray(self.vao)
+
+    def _draw_multiple_bonds(self, line_width):
+        """ Second pass: double/triple bonds (shaders/lines.py, lines_multi). """
+        program = self.vm_glcore.shader_programs.get("lines_multi")
+        if program is None or self.multi_vao is None or not self._multi_ranges:
+            return
+        GL.glUseProgram(program)
+        GL.glLineWidth(line_width)
+        self.vm_glcore.load_matrices(program, self.vm_object.model_mat)
+        self.vm_glcore.load_fog(program)
+        u_mode = self.vm_glcore._get_uniform_location(program, "u_mode")
+        params = self.vm_session.vm_config.gl_parameters
+        GL.glUniform1f(self.vm_glcore._get_uniform_location(program, "u_separation"),
+                       float(params.get("lines_bond_separation", 0.20)) * float(params.get("lines_bond_spacing", 1.0)))
+        GL.glUniform1f(self.vm_glcore._get_uniform_location(program, "u_shrink"), 0.15)
+        GL.glBindVertexArray(self.multi_vao)
+        for mode, offset, n in self._multi_ranges:
+            GL.glUniform1i(u_mode, mode)
+            GL.glDrawElements(GL.GL_LINES_ADJACENCY, n, GL.GL_UNSIGNED_INT, ctypes.c_void_p(offset))
+        GL.glBindVertexArray(0)
 
     def draw_representation(self):
         """ Function doc """
@@ -714,13 +984,16 @@ class LinesRepresentation(Representation):
         if self.was_rep_ind_modified:
             self._load_ind_vbo(ind_vbo=True)
             self.was_rep_ind_modified = False
+            self._multi_key = None      # ind_vbo got every pair again
         if self.was_col_modified:
             self._load_color_vbo(None)
             self.was_col_modified = False
-        
-        GL.glDrawElements(GL.GL_LINES, self.elements, GL.GL_UNSIGNED_INT, None)
-        
+
+        self._update_multiple_bonds()
+        GL.glDrawElements(GL.GL_LINES, self._n_single_elems, GL.GL_UNSIGNED_INT, None)
+
         GL.glBindVertexArray(0)
+        self._draw_multiple_bonds(line_width)
         self._disable_anti_alias_to_lines()
         GL.glLineWidth(1)
         GL.glUseProgram(0)
@@ -817,6 +1090,10 @@ class SticksRepresentation(Representation):
     def __init__(self, vismol_object, vismol_glcore, indexes, active=True, is_dynamic = False, name = "sticks", uniform_color = None):
         """ Class initialiser """
         super(SticksRepresentation, self).__init__(vismol_object, vismol_glcore, name, active, indexes, is_dynamic)
+        # [EN] 2026-10-15: "sticks" follows gl_parameters['sticks_radius'] at
+        # every draw (_sync_radius), so Preferences changes apply on the fly;
+        # set_radius() fixes a radius for this representation instead.
+        self._radius_fixed = False
         if  name == "sticks":
             self.radius = self.vm_session.vm_config.gl_parameters["sticks_radius"]
             self.spheres = None
@@ -862,8 +1139,35 @@ class SticksRepresentation(Representation):
             
 
     def set_radius (self, radius):
-        """ Function doc """
+        """ Fixed radius for this representation (no longer follows
+            gl_parameters['sticks_radius']). """
         self.radius = radius
+        self._radius_fixed = True
+
+    def _multiple_bond_geometry(self):
+        """ (radius double, radius triple, spacing double, spacing triple) in
+            Angstrom from gl_parameters (defaults: the look before these
+            parameters existed, 0.4 x and 1.0 x the stick radius). """
+        if self.name != "sticks":
+            return (0.0, 0.0, 0.0, 0.0)
+        gp = self.vm_session.vm_config.gl_parameters
+        r = float(self.radius)
+        out = []
+        for key, default in (("sticks_radius_double", 0.4 * r), ("sticks_radius_triple", 0.4 * r),
+                             ("sticks_spacing_double", r), ("sticks_spacing_triple", r)):
+            try:
+                value = float(gp.get(key, default))
+            except (TypeError, ValueError):
+                value = default
+            out.append(value if value > 0.0 else default)
+        return out
+
+    def _sync_radius(self):
+        if self.name == "sticks" and not self._radius_fixed:
+            try:
+                self.radius = float(self.vm_session.vm_config.gl_parameters["sticks_radius"])
+            except (KeyError, TypeError, ValueError):
+                pass
 
     def _get_bond_order_per_bond(self):
         """ Retorna a ordem de ligacao PAREADA 1:1 com self.vm_object.index_bonds
@@ -984,6 +1288,7 @@ class SticksRepresentation(Representation):
             zero se o tamanho mudou (uma Buffer Texture nao pode so' 'crescer'
             sem realocar). """
         orders = self._get_bond_order_per_bond()
+        self._last_bond_orders = orders
         if getattr(self, "bond_order_tbo_buf", None) is None:
             self.bond_order_tbo_buf, self.bond_order_tex = self._make_gl_bond_order_texture_buffer(orders)
             self._bond_order_tbo_size = orders.shape[0]
@@ -997,6 +1302,46 @@ class SticksRepresentation(Representation):
             self._bond_order_tbo_size = orders.shape[0]
         else:
             self._update_gl_bond_order_texture_buffer(self.bond_order_tbo_buf, orders)
+
+    def _refresh_bond_side_tbo(self, orders, coords_changed):
+        """ [EN] 2026-10-14: Buffer Texture u_bond_side_tbo (RGBA32F, one texel
+            per bond, see multiple_bond_sides and shaders/sticks.py): plane of
+            each double bond, so that they look like the "lines" ones. The
+            reference atoms (rings, substituents) are searched again only when
+            the drawn pairs or their orders change; the vectors are recomputed
+            when the frame or the coordinates change. Returns True when the
+            texture holds valid data for this draw. """
+        n_bonds = int(self.indexes.shape[0] // 2)
+        if n_bonds == 0 or orders.shape[0] != n_bonds or not (orders >= 2).any():
+            return False
+        ref_key = (id(self.indexes), n_bonds, orders.tobytes())
+        if ref_key != getattr(self, "_side_ref_key", None):
+            if self.is_dynamic:
+                all_pairs = self.indexes
+            else:
+                all_pairs = getattr(self.vm_object, "index_bonds", None)
+                if all_pairs is None or len(all_pairs) == 0:
+                    all_pairs = self.indexes
+            self._side_mode, self._side_ref = multiple_bond_references(self.indexes, orders, all_pairs,
+                                                                       _hydrogen_test(self.vm_object))
+            self._side_ref_key = ref_key
+            self._side_coord_key = None
+        frame, f = self.vm_glcore._safe_frame_coords(self.vm_object)
+        coord_key = (f, id(frame))
+        if coords_changed or coord_key != getattr(self, "_side_coord_key", None):
+            sides = np.ascontiguousarray(multiple_bond_sides(self.indexes, self._side_mode, self._side_ref, frame))
+            if getattr(self, "bond_side_tex", None) is None:
+                self.bond_side_tbo_buf = GL.glGenBuffers(1)
+                self.bond_side_tex = GL.glGenTextures(1)
+                GL.glBindTexture(GL.GL_TEXTURE_BUFFER, self.bond_side_tex)
+                GL.glBindBuffer(GL.GL_TEXTURE_BUFFER, self.bond_side_tbo_buf)
+                GL.glTexBuffer(GL.GL_TEXTURE_BUFFER, GL.GL_RGBA32F, self.bond_side_tbo_buf)
+                GL.glBindTexture(GL.GL_TEXTURE_BUFFER, 0)
+            GL.glBindBuffer(GL.GL_TEXTURE_BUFFER, self.bond_side_tbo_buf)
+            GL.glBufferData(GL.GL_TEXTURE_BUFFER, sides.nbytes, sides, GL.GL_DYNAMIC_DRAW)
+            GL.glBindBuffer(GL.GL_TEXTURE_BUFFER, 0)
+            self._side_coord_key = coord_key
+        return True
 
     # [ATUALIZACAO] O override de _make_gl_sel_representation_vao_and_vbos foi
     # removido: o picking/selecao nao precisa mais de nenhum buffer de ordem
@@ -1020,6 +1365,7 @@ class SticksRepresentation(Representation):
     def draw_representation(self):
         """ Function doc """
         self._check_vao_and_vbos ()
+        self._sync_radius()
         self._enable_anti_alias_to_lines()
         GL.glEnable(GL.GL_CULL_FACE)
         GL.glCullFace(GL.GL_BACK)
@@ -1035,6 +1381,7 @@ class SticksRepresentation(Representation):
         GL.glUniform1f(custom_int_location, self.radius)  # Set the integer value to  _size
         
         
+        coords_changed = self.was_rep_coord_modified
         if self.was_rep_coord_modified:
             self._load_coord_vbo(coord_vbo=True)
             self.was_rep_coord_modified = False
@@ -1057,7 +1404,27 @@ class SticksRepresentation(Representation):
         # ligacao = 4 bytes); _refresh_bond_order_tbo so recria buffer/textura
         # do zero se o NUMERO de ligacoes mudou, senao so' atualiza o conteudo.
         self._refresh_bond_order_tbo()
-        
+        has_side = self._refresh_bond_side_tbo(self._last_bond_orders, coords_changed)
+        u_has_side_loc = self.vm_glcore._get_uniform_location(self.shader_program, "u_has_side")
+        u_side_tbo_loc = self.vm_glcore._get_uniform_location(self.shader_program, "u_bond_side_tbo")
+        has_side = has_side and u_has_side_loc != -1 and u_side_tbo_loc != -1
+        if u_has_side_loc != -1:
+            GL.glUniform1i(u_has_side_loc, 1 if has_side else 0)
+        if has_side:
+            GL.glActiveTexture(GL.GL_TEXTURE2)
+            GL.glBindTexture(GL.GL_TEXTURE_BUFFER, self.bond_side_tex)
+            GL.glUniform1i(u_side_tbo_loc, 2)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+        # [EN] 2026-10-15: radius and spacing of double/triple bonds (Angstrom,
+        # Preferences > Sticks; shared by sticks and dynamic bonds, read at
+        # every draw so changes apply on the fly). Other users of this class
+        # (ribbons) send 0 = the shader's fallback.
+        for uniform, value in zip(("u_rad_double", "u_rad_triple", "u_sep_double", "u_sep_triple"),
+                                  self._multiple_bond_geometry()):
+            loc = self.vm_glcore._get_uniform_location(self.shader_program, uniform)
+            if loc != -1:
+                GL.glUniform1f(loc, value)
+
         # Ligacoes multiplas: 3 passadas. A passada 0 desenha o cilindro
         # central/primeiro de TODAS as ligacoes; as passadas 1 e 2 desenham os
         # cilindros laterais apenas onde a ordem (>=2, >=3) exige -- o geometry
@@ -1070,7 +1437,9 @@ class SticksRepresentation(Representation):
             # Separacao entre cilindros de uma ligacao multipla. Reduzida para
             # acompanhar os tubos mais finos (eff_rad*0.6 no shader). Aumente
             # para afastar, diminua para aproximar.
-            GL.glUniform1f(u_sep_loc, float(self.radius) * 1.0)
+            # [EN] fallback only: the spacings of double/triple bonds come
+            # from u_sep_double / u_sep_triple (_multiple_bond_geometry).
+            GL.glUniform1f(u_sep_loc, float(self.radius))
         
         # Vincula a Buffer Texture de ordem de ligacao numa unidade de textura
         # dedicada (GL_TEXTURE1, para nao colidir com a unidade 0 usada pelas
@@ -1123,6 +1492,10 @@ class SticksRepresentation(Representation):
             GL.glActiveTexture(GL.GL_TEXTURE1)
             GL.glBindTexture(GL.GL_TEXTURE_BUFFER, 0)
             GL.glActiveTexture(GL.GL_TEXTURE0)
+        if has_side:
+            GL.glActiveTexture(GL.GL_TEXTURE2)
+            GL.glBindTexture(GL.GL_TEXTURE_BUFFER, 0)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
         
         GL.glBindVertexArray(0)
         self._disable_anti_alias_to_lines()
@@ -1143,7 +1516,7 @@ class SticksRepresentation(Representation):
         self.vm_glcore.load_matrices(self.sel_shader_program, self.vm_object.model_mat)
         GL.glBindVertexArray(self.sel_vao)
         
-        #radius = self.vm_session.vm_config.gl_parameters["sticks_radius"]
+        self._sync_radius()
         custom_int_location = self.vm_glcore._get_uniform_location(self.sel_shader_program, "vert_rad")
         GL.glUniform1f(custom_int_location, self.radius)
         # Picking: um cilindro por ligacao (passada 0). Independe de bond_order,
@@ -1294,6 +1667,17 @@ class SpheresRepresentation(Representation):
         self.vm_glcore.load_lights(self.shader_program)
         self.vm_glcore.load_fog(self.shader_program)
         GL.glBindVertexArray(self.vao)
+        
+        # [EN] 2026-10-15: the joint spheres of the sticks (mode 3) follow
+        # gl_parameters['sticks_radius'] (Preferences, on the fly).
+        if self.mode == 3:
+            try:
+                r = float(self.vm_session.vm_config.gl_parameters.get("sticks_radius", self.rad))
+            except (TypeError, ValueError):
+                r = self.rad
+            if r != self.rad:
+                self.rad = r
+                self.was_col_modified = True
         
         # colors/rads only depend on which atoms are shown and their color
         # scheme, not on the current frame, so they're only rebuilt when
@@ -1889,7 +2273,7 @@ class SurfaceRepresentation(Representation):
     def set_render_mode(self, mode):
         """ mode: 'surface' (preenchido) ou 'lines' (wireframe) """
         if mode not in ("surface", "lines"):
-            raise ValueError("render_mode deve ser 'surface' ou 'lines', recebido: {}".format(mode))
+            raise ValueError("render_mode must be 'surface' or 'lines', got: {}".format(mode))
         self.render_mode = mode
 
     def set_alpha(self, alpha):
@@ -1902,7 +2286,7 @@ class SurfaceRepresentation(Representation):
         media das faces adjacentes -- ver compute_smooth_normals em
         surface_analysis_window.py). """
         if mode not in ("flat", "smooth"):
-            raise ValueError("shading mode deve ser 'flat' ou 'smooth', recebido: {}".format(mode))
+            raise ValueError("shading mode must be 'flat' or 'smooth', got: {}".format(mode))
         self.smooth_shading = ( mode == "smooth" )
 
     def _make_gl_representation_vao_and_vbos(self, debug = False):

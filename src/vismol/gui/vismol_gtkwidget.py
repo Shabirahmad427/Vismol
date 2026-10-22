@@ -932,7 +932,7 @@ class VismolGTKWidget(_WidgetBase):
                     pass
             glMenu.append(mitem)
     
-    def capture_screenshot(self, scale_factor=1):
+    def capture_screenshot(self, scale_factor=1, return_depth=False):
         """ Renders a fresh frame and reads it back from the OpenGL
             framebuffer as a numpy RGBA array (height, width, 4), ready
             to be saved or further processed (e.g. the cartoon filter in
@@ -949,6 +949,10 @@ class VismolGTKWidget(_WidgetBase):
                              enlargement of the same pixels. Default 1
                              captures at the widget's current size.
 
+            return_depth -- also return the scene depth, as
+                             VismolGLCore.render_to_image() does: the
+                             result is then (image, depth), or None.
+
             Returns:
             image -- np.uint8 array of shape (height*scale_factor,
                      width*scale_factor, 4), or None if the GL context
@@ -964,11 +968,11 @@ class VismolGTKWidget(_WidgetBase):
                 dprint("Error in OpenGL context")
                 return None
 
-        if scale_factor != 1:
+        if scale_factor != 1 or return_depth:
             # vm_glcore.render_to_image() handles the offscreen
             # framebuffer at the higher resolution, including rendering
             # into it and restoring every bit of state afterwards.
-            return self.vm_glcore.render_to_image(scale_factor)
+            return self.vm_glcore.render_to_image(scale_factor, return_depth=return_depth)
 
         # Render a fresh frame synchronously into this widget's GL
         # context right before reading pixels back, so the capture
@@ -1036,10 +1040,11 @@ class VismolGTKWidget(_WidgetBase):
             re-captures the scene at full quality rather than upscaling
             this preview image.
         """
-        image = self.capture_screenshot()
-        if image is None:
+        captured = self.capture_screenshot(return_depth=True)
+        if captured is None:
             return
-        open_preview(image, glwidget=self)
+        image, depth = captured
+        open_preview(image, glwidget=self, depth=depth)
 
 
 
@@ -1053,12 +1058,21 @@ FILTER_DEFAULTS = {
     "colors": 16,
     "edge_threshold": 50,
     "blend": 0.8,
+    # "contour" mode (apply_contour_filter)
+    "line_width": 1.5,
+    "line_color": [0.05, 0.05, 0.05],
+    "inner_lines": True,
+    # effects, usable with any style (they need the scene's depth map)
+    "ao": False,
+    "ao_strength": 0.6,
+    "halo": False,
+    "transparent_background": False,
 }
 # Kept as an alias for backwards compatibility with any saved presets
 # that still reference the old name.
 CARTOON_FILTER_DEFAULTS = FILTER_DEFAULTS
 
-FILTER_MODES = ("none", "outline", "cartoon")
+FILTER_MODES = ("none", "contour", "pencil", "outline", "cartoon")
 
 RENDER_PRESETS_DIR = os.path.join(os.environ.get("HOME", "."), ".VisMol", "render_presets")
 
@@ -1136,6 +1150,223 @@ def apply_outline_filter(img, params, posterize):
     return Image.blend(colored, outlined, blend_val)
 
 
+def contour_mask(depth, inner_lines=True):
+    """ Finds the outlines of the scene from its depth map (as returned by
+        VismolGLCore.render_to_image(return_depth=True)) instead of from
+        the picture's colours, so shading gradients never produce false
+        edges. A pixel is on an outline when
+
+        - the depth steps there (silhouettes, one object in front of
+          another), or
+        - with inner_lines, the surface direction turns sharply (where an
+          atom meets its bond, two spheres intersect, the edge of a ribbon).
+
+        Returns a boolean (height, width) array.
+    """
+    z = depth["distance"]
+    background = ~np.isfinite(z)
+    if background.all():
+        return np.zeros(z.shape, dtype=bool)
+    z = np.where(background, z[~background].max() + 1000.0, z).astype(np.float32)
+    pixel = depth["pixel_size"] * z                 # Angstrom per pixel, at each depth
+    # the step threshold grows with the pixel size so that the curvature of
+    # a small, far-away sphere is not mistaken for a step
+    threshold = 0.05 + pixel
+    edge = np.zeros(z.shape, dtype=bool)
+    for axis in (0, 1):
+        zp = np.pad(z, [(1, 1) if a == axis else (0, 0) for a in (0, 1)], mode="edge")
+        before = np.take(zp, range(0, z.shape[axis]), axis=axis)
+        after = np.take(zp, range(2, z.shape[axis] + 2), axis=axis)
+        edge |= np.abs(before - 2.0 * z + after) > threshold
+    if inner_lines:
+        # normals are stored as 128 + 127 * n: neighbours more than ~35
+        # degrees apart are a crease
+        normal = depth["normals"].astype(np.int16) - 128
+        limit = 0.82 * 127.0 * 127.0
+        dot = (normal[:, 1:].astype(np.int32) * normal[:, :-1]).sum(-1)
+        crease = (dot < limit) & ~background[:, 1:] & ~background[:, :-1]
+        edge[:, 1:] |= crease
+        edge[:, :-1] |= crease
+        dot = (normal[1:].astype(np.int32) * normal[:-1]).sum(-1)
+        crease = (dot < limit) & ~background[1:] & ~background[:-1]
+        edge[1:] |= crease
+        edge[:-1] |= crease
+    return edge
+
+
+def apply_contour_filter(img, depth, params):
+    """ Draws outlines found by contour_mask() over img (colours and
+        shading untouched). Combined with the "Flat" shading mode this gives
+        the illustration look: flat colour + thin dark outline.
+
+        Keyword arguments:
+        img    -- PIL.Image (RGB or RGBA), same size as the depth map.
+        depth  -- dict from VismolGLCore.render_to_image(return_depth=True).
+        params -- "line_width" (pixels at screen resolution; scaled with
+                  the export resolution), "line_color" ([r, g, b], 0..1),
+                  "inner_lines" (bool).
+
+        Returns:
+        A new PIL.Image (RGB).
+    """
+    base = img.convert("RGB")
+    if depth is None or depth["distance"].shape != (base.height, base.width):
+        return base
+    width = float(params.get("line_width", FILTER_DEFAULTS["line_width"])) * depth.get("scale_factor", 1)
+    color = params.get("line_color", FILTER_DEFAULTS["line_color"])
+    edge = contour_mask(depth, bool(params.get("inner_lines", True)))
+    mask = Image.fromarray((edge * 255).astype(np.uint8))
+    # the raw mask is about 2 pixels wide (both sides of each edge)
+    grow = int(round(width)) - 2
+    if grow >= 1:
+        mask = mask.filter(ImageFilter.MaxFilter(2 * ((grow + 1) // 2) + 1))
+    mask = mask.filter(ImageFilter.GaussianBlur(0.6))            # antialias
+    alpha = np.asarray(mask, dtype=np.float32)[..., None] / 255.0
+    alpha = np.clip(alpha * (1.4 if width >= 2 else width * 0.7), 0.0, 1.0)
+    rgb = np.asarray(base, dtype=np.float32)
+    line = np.array(color[:3], dtype=np.float32) * 255.0
+    out = rgb * (1.0 - alpha) + line * alpha
+    return Image.fromarray(out.astype(np.uint8), mode="RGB")
+
+
+def _depth_matches(img, depth):
+    return depth is not None and depth["distance"].shape == (img.height, img.width)
+
+
+def _filled_depth(depth, margin):
+    """ The depth map with the background replaced by a finite value
+        `margin` Angstrom behind the farthest object. Returns (z, background
+        mask), or (None, mask) when the image is all background. """
+    z = depth["distance"]
+    background = ~np.isfinite(z)
+    if background.all():
+        return None, background
+    return np.where(background, z[~background].max() + margin, z).astype(np.float32), background
+
+
+def _blur_float(array, sigma):
+    """ Gaussian-like blur of a 2D float array: three box blurs done with
+        running sums, so the cost does not grow with sigma (PIL's
+        GaussianBlur does not take float images). Edges are extended. """
+    # three boxes of half-width r have variance r(r+1): solve for sigma
+    radius = int(round((np.sqrt(1.0 + 4.0 * sigma * sigma) - 1.0) / 2.0))
+    if radius < 1:
+        return array.astype(np.float32)
+    out = array.astype(np.float64)
+    size = 2 * radius + 1
+    for axis in (0, 1):
+        for _ in range(3):
+            pad = [(radius + 1, radius) if a == axis else (0, 0) for a in (0, 1)]
+            total = np.cumsum(np.pad(out, pad, mode="edge"), axis=axis)
+            n = out.shape[axis]
+            out = (np.take(total, range(size, size + n), axis=axis)
+                   - np.take(total, range(0, n), axis=axis)) / size
+    return out.astype(np.float32)
+
+
+def ambient_occlusion(depth, radii=(1.2, 3.5)):
+    """ Occlusion estimated from the depth map alone (the "depth unsharp
+        mask" of Luft, Colditz & Deussen, 2006): a pixel that lies behind
+        the average depth of its surroundings sits in a pocket or next to
+        something nearer, and receives less ambient light. Two radii (in
+        Angstrom) are averaged: contacts between atoms and wider cavities.
+
+        Returns a float32 (height, width) array, 0 = open, 1 = fully occluded.
+    """
+    z, background = _filled_depth(depth, max(radii))
+    if z is None:
+        return np.zeros(background.shape, dtype=np.float32)
+    pixel = depth["pixel_size"] * float(np.median(z[~background]))   # Angstrom per pixel
+    occlusion = np.zeros(z.shape, dtype=np.float32)
+    for radius in radii:
+        sigma = max(radius / pixel, 1.0)
+        behind = (z - _blur_float(z, sigma)) / radius
+        # range check: something far in front (several radii) is not an
+        # occluder, it merely overlaps in the picture -- fade it out
+        occlusion += np.clip(behind, 0.0, 1.0) * np.clip(3.0 - behind, 0.0, 1.0)
+    occlusion /= len(radii)
+    occlusion[background] = 0.0
+    return occlusion
+
+
+def apply_ambient_occlusion(img, depth, params):
+    """ Darkens img where ambient_occlusion() finds pockets and contacts. """
+    strength = float(params.get("ao_strength", FILTER_DEFAULTS["ao_strength"]))
+    # the raw estimate rarely exceeds ~0.5: stretch it so strength = 1 is strong
+    shade = 1.0 - np.clip(2.0 * strength * ambient_occlusion(depth), 0.0, 0.8)
+    rgb = np.asarray(img.convert("RGB"), dtype=np.float32) * shade[..., None]
+    return Image.fromarray(rgb.astype(np.uint8), mode="RGB")
+
+
+def apply_depth_halo(img, depth, params):
+    """ Depth halo: whatever passes just behind a nearer object fades to
+        the background colour next to that object's edge, so overlapping
+        layers separate visually (as in VMD/QuteMol-style halos). """
+    z, background = _filled_depth(depth, 5.0)
+    rgb = np.asarray(img.convert("RGB"), dtype=np.float32)
+    if z is None:
+        return Image.fromarray(rgb.astype(np.uint8), mode="RGB")
+    scale = depth.get("scale_factor", 1)
+    # 8-bit depth is enough to tell "clearly nearer" apart, and lets PIL's
+    # fast rank filter find the nearest thing around each pixel
+    z_min, z_max = float(z.min()), float(z.max())
+    span = max(z_max - z_min, 1e-3)
+    z8 = Image.fromarray(((z - z_min) / span * 255.0).astype(np.uint8))
+    nearest = np.asarray(z8.filter(ImageFilter.MinFilter(2 * int(round(3 * scale)) + 1)), dtype=np.float32)
+    gap = (np.asarray(z8, dtype=np.float32) - nearest) * span / 255.0     # Angstrom
+    halo = np.clip((gap - 0.6) / 0.6, 0.0, 1.0)       # only behind a clear step
+    halo = _blur_float(halo.astype(np.float32), 0.8 * scale)[..., None] * 0.85
+    back = np.array(depth.get("background", [1.0, 1.0, 1.0]), dtype=np.float32) * 255.0
+    return Image.fromarray((rgb * (1.0 - halo) + back * halo).astype(np.uint8), mode="RGB")
+
+
+def apply_transparent_background(img, depth):
+    """ Returns img as RGBA with the background made transparent. A pixel
+        counts as background when nothing solid was drawn there AND it still
+        has the background colour, so lines, labels and contours drawn over
+        the background are kept; their antialiased edges get partial alpha. """
+    rgb = np.asarray(img.convert("RGB"), dtype=np.float32)
+    back = np.array(depth.get("background", [1.0, 1.0, 1.0]), dtype=np.float32) * 255.0
+    difference = np.abs(rgb - back).max(-1)
+    alpha = np.clip(difference / 48.0, 0.0, 1.0)
+    alpha[np.isfinite(depth["distance"])] = 1.0
+    # remove the background colour already blended into the soft edges
+    a = np.maximum(alpha, 1e-3)[..., None]
+    color = np.clip((rgb - back * (1.0 - a)) / a, 0.0, 255.0)
+    out = np.dstack((color, alpha[..., None] * 255.0)).astype(np.uint8)
+    return Image.fromarray(out, mode="RGBA")
+
+
+def apply_pencil_filter(img, depth, params):
+    """ Pencil drawing: the contour lines of apply_contour_filter() plus
+        diagonal hatching where the surface turns away from a light at the
+        upper left (cross-hatched where darkest), over a pale wash of the
+        original colours. The tone comes from the normal map, so it does not
+        depend on the shading mode the scene was drawn with. """
+    base = img.convert("RGB")
+    if not _depth_matches(base, depth):
+        return base
+    scale = depth.get("scale_factor", 1)
+    foreground = np.isfinite(depth["distance"])
+    normal = (depth["normals"].astype(np.float32) - 128.0) / 127.0
+    light = np.array([-0.5, 0.6, 0.62], dtype=np.float32)
+    tone = np.clip((normal * light).sum(-1), 0.0, 1.0)
+    tone *= 1.0 - np.clip(2.0 * ambient_occlusion(depth), 0.0, 0.8)
+    height, width = tone.shape
+    yy, xx = np.mgrid[0:height, 0:width]
+    period = 6 * scale
+    stroke = max(1, int(round(1.3 * scale)))
+    hatch = (((xx + yy) % period) < stroke) & (tone < 0.45)
+    hatch |= (((xx - yy) % period) < stroke) & (tone < 0.18)
+    hatch &= foreground
+    ink = _blur_float(hatch.astype(np.float32), 0.45 * scale)[..., None] * 0.75
+    rgb = np.asarray(base, dtype=np.float32)
+    paper = np.where(foreground[..., None], 255.0 - (255.0 - rgb) * 0.30, rgb)
+    line = np.array(params.get("line_color", FILTER_DEFAULTS["line_color"])[:3], dtype=np.float32) * 255.0
+    out = Image.fromarray((paper * (1.0 - ink) + line * ink).astype(np.uint8), mode="RGB")
+    return apply_contour_filter(out, depth, params)
+
+
 def apply_cartoon_filter(img, params):
     """ Backwards-compatible alias for apply_outline_filter(img, params,
         posterize=True) - the "cartoon" look (PyMOL ray_trace_mode 3).
@@ -1155,6 +1386,12 @@ class RenderStylePreset:
         """
         filter_mode -- one of FILTER_MODES:
                        "none"    - no post-processing (raw screenshot).
+                       "contour" - outline taken from the scene's depth
+                                   (the real geometry); needs the depth
+                                   map passed to apply().
+                       "pencil"  - contour + hatching (needs depth too).
+        filter_params also carries the effects that combine with any
+        style: "ao" (ambient occlusion), "halo", "transparent_background".
                        "outline" - PyMOL ray_trace_mode 1 style: original
                                    colors/shading + a black outline.
                        "cartoon" - PyMOL ray_trace_mode 3 style: quantized
@@ -1190,14 +1427,35 @@ class RenderStylePreset:
             params = data.get("filter_params")
         return cls(name=data.get("name", "default"), filter_mode=mode, filter_params=params)
 
-    def apply(self, img):
-        """ Returns img with this preset's effect applied (or img
-            untouched, converted to RGB, if filter_mode is "none").
+    @property
+    def needs_depth(self):
+        params = self.filter_params
+        return (self.filter_mode in ("contour", "pencil") or bool(params.get("ao"))
+                or bool(params.get("halo")) or bool(params.get("transparent_background")))
+
+    def apply(self, img, depth=None):
+        """ Returns img with this preset's style and effects applied: RGB,
+            or RGBA when "transparent_background" is on. depth (see
+            VismolGLCore.render_to_image(return_depth=True)) is needed by
+            the "contour"/"pencil" styles and by every effect; without it
+            those are skipped.
         """
-        if self.filter_mode == "none":
-            return img.convert("RGB")
-        return apply_outline_filter(img, self.filter_params,
-                                     posterize=(self.filter_mode == "cartoon"))
+        params = self.filter_params
+        out = img.convert("RGB")
+        has_depth = _depth_matches(out, depth)
+        if has_depth and params.get("ao"):
+            out = apply_ambient_occlusion(out, depth, params)
+        if self.filter_mode == "contour":
+            out = apply_contour_filter(out, depth, params)
+        elif self.filter_mode == "pencil":
+            out = apply_pencil_filter(out, depth, params)
+        elif self.filter_mode in ("outline", "cartoon"):
+            out = apply_outline_filter(out, params, posterize=(self.filter_mode == "cartoon"))
+        if has_depth and params.get("halo"):
+            out = apply_depth_halo(out, depth, params)
+        if has_depth and params.get("transparent_background"):
+            out = apply_transparent_background(out, depth)
+        return out
 
     @staticmethod
     def _safe_filename(name):
@@ -1252,9 +1510,11 @@ class PreviewWindow(Gtk.Window):
         full quality, not an upscaled/blurred copy of the small preview.
     """
 
-    def __init__(self, image_array, glwidget):
+    def __init__(self, image_array, glwidget, depth=None):
         super().__init__(title="Preview / Export")
         self.glwidget = glwidget
+        # depth map matching image_array, for the "contour" style
+        self.preview_depth = depth
 
         self.set_default_size(640, 420)
         # Independent top-level window, not a nested mainloop: closing it
@@ -1294,8 +1554,6 @@ class PreviewWindow(Gtk.Window):
         controls.pack_start(self.btn_refresh, False, False, 0)
         
         mode_box.pack_start(Gtk.Label(label="Style:"), False, False, 0)
-        
-        mode_box.pack_start(Gtk.Label(label="Style:"), False, False, 0)
         self.mode_combo = Gtk.ComboBoxText()
         self._mode_labels = [
             #("none", "Sem efeito"),
@@ -1303,6 +1561,8 @@ class PreviewWindow(Gtk.Window):
             #("cartoon", "Cartoon (posterizado)"),
             
             ("none"   , "No effect"), 
+            ("contour", "Contour (from geometry)"),
+            ("pencil" , "Pencil (hatching)"),
             ("outline", 'Outline (original color)'), 
             ("cartoon", "Cartoon (posterized)"),
         ]
@@ -1321,6 +1581,41 @@ class PreviewWindow(Gtk.Window):
                                          FILTER_DEFAULTS["edge_threshold"], controls)
         self.blend = self._create_slider("Contour Intensity", 0.0, 1.0,
                                           FILTER_DEFAULTS["blend"], controls)
+
+        controls.pack_start(Gtk.Separator(), False, False, 4)
+
+        # --- "Contour (from geometry)" and "Pencil" styles ---
+        self.line_width = self._create_slider("Contour width", 0.5, 6.0,
+                                              FILTER_DEFAULTS["line_width"], controls)
+        contour_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        contour_box.pack_start(Gtk.Label(label="Contour color:"), False, False, 0)
+        self.line_color = Gtk.ColorButton()
+        self.line_color.set_rgba(Gdk.RGBA(*FILTER_DEFAULTS["line_color"], 1.0))
+        self.line_color.connect("color-set", self.on_change)
+        contour_box.pack_start(self.line_color, False, False, 0)
+        controls.pack_start(contour_box, False, False, 0)
+        self.inner_lines = Gtk.CheckButton(label="Inner lines (atom/bond joints, creases)")
+        self.inner_lines.set_active(FILTER_DEFAULTS["inner_lines"])
+        self.inner_lines.connect("toggled", self.on_change)
+        controls.pack_start(self.inner_lines, False, False, 0)
+
+        controls.pack_start(Gtk.Separator(), False, False, 4)
+
+        # --- effects, combined with whatever style is selected ---
+        self.chk_ao = Gtk.CheckButton(label="Ambient occlusion")
+        self.chk_ao.set_active(FILTER_DEFAULTS["ao"])
+        self.chk_ao.connect("toggled", self.on_change)
+        controls.pack_start(self.chk_ao, False, False, 0)
+        self.ao_strength = self._create_slider("Occlusion strength", 0.0, 1.0,
+                                               FILTER_DEFAULTS["ao_strength"], controls)
+        self.chk_halo = Gtk.CheckButton(label="Depth halo")
+        self.chk_halo.set_active(FILTER_DEFAULTS["halo"])
+        self.chk_halo.connect("toggled", self.on_change)
+        controls.pack_start(self.chk_halo, False, False, 0)
+        self.chk_transparent = Gtk.CheckButton(label="Transparent background")
+        self.chk_transparent.set_active(FILTER_DEFAULTS["transparent_background"])
+        self.chk_transparent.connect("toggled", self.on_change)
+        controls.pack_start(self.chk_transparent, False, False, 0)
 
         controls.pack_start(Gtk.Separator(), False, False, 4)
 
@@ -1392,6 +1687,13 @@ class PreviewWindow(Gtk.Window):
                 "colors": int(self.colors.get_value()),
                 "edge_threshold": int(self.edge.get_value()),
                 "blend": self.blend.get_value(),
+                "line_width": self.line_width.get_value(),
+                "line_color": list(self.line_color.get_rgba())[:3],
+                "inner_lines": self.inner_lines.get_active(),
+                "ao": self.chk_ao.get_active(),
+                "ao_strength": self.ao_strength.get_value(),
+                "halo": self.chk_halo.get_active(),
+                "transparent_background": self.chk_transparent.get_active(),
             },
         )
 
@@ -1406,11 +1708,24 @@ class PreviewWindow(Gtk.Window):
         self.colors.set_value(preset.filter_params.get("colors", FILTER_DEFAULTS["colors"]))
         self.edge.set_value(preset.filter_params.get("edge_threshold", FILTER_DEFAULTS["edge_threshold"]))
         self.blend.set_value(preset.filter_params.get("blend", FILTER_DEFAULTS["blend"]))
+        self.line_width.set_value(preset.filter_params.get("line_width", FILTER_DEFAULTS["line_width"]))
+        self.line_color.set_rgba(Gdk.RGBA(*preset.filter_params.get("line_color", FILTER_DEFAULTS["line_color"])[:3], 1.0))
+        self.inner_lines.set_active(bool(preset.filter_params.get("inner_lines", True)))
+        self.chk_ao.set_active(bool(preset.filter_params.get("ao", False)))
+        self.ao_strength.set_value(preset.filter_params.get("ao_strength", FILTER_DEFAULTS["ao_strength"]))
+        self.chk_halo.set_active(bool(preset.filter_params.get("halo", False)))
+        self.chk_transparent.set_active(bool(preset.filter_params.get("transparent_background", False)))
         self.update_preview()
 
     def update_preview(self):
         preset = self._current_preset()
-        img = preset.apply(self.preview_base)
+        img = preset.apply(self.preview_base, self.preview_depth)
+        if img.mode == "RGBA":
+            # show transparency over a checkerboard
+            yy, xx = np.mgrid[0:img.height, 0:img.width]
+            board = np.where(((xx // 12 + yy // 12) % 2)[..., None] == 0, 200, 240).astype(np.uint8)
+            img = Image.alpha_composite(Image.fromarray(np.dstack((board, board, board, np.full_like(board, 255))), mode="RGBA"),
+                                        img).convert("RGB")
 
         data = np.array(img)
         height, width, _ = data.shape
@@ -1440,7 +1755,10 @@ class PreviewWindow(Gtk.Window):
     def on_refresh_image (self, widget):
         """ Function doc """
         dprint('Refresh image')
-        image = self.glwidget.capture_screenshot()
+        captured = self.glwidget.capture_screenshot(return_depth=True)
+        if captured is None:
+            return
+        image, self.preview_depth = captured
         self.preview_base =  Image.fromarray(image)
         self.update_preview()
         
@@ -1463,7 +1781,7 @@ class PreviewWindow(Gtk.Window):
             preset = self._current_preset(name=name)
             path = preset.save()
             self._refresh_preset_list()
-            self.status_label.set_text("Preset salvo: {}".format(path))
+            self.status_label.set_text("Preset saved: {}".format(path))
 
     def on_load_preset(self, widget):
         name = self.preset_combo.get_active_text()
@@ -1562,20 +1880,22 @@ class PreviewWindow(Gtk.Window):
         # Salva diretório para próxima chamada
         self.last_export_dir = os.path.dirname(filename)
         
-        # Gera nome único se já existir
-        full_res_array = self.glwidget.capture_screenshot(
-            scale_factor=scale_factor
+        # Re-capture at the export resolution (with the matching depth map
+        # when the style draws its outline from the geometry)
+        preset = self._current_preset()
+        captured = self.glwidget.capture_screenshot(
+            scale_factor=scale_factor, return_depth=preset.needs_depth
         )
 
-        if full_res_array is None:
+        if captured is None:
             self.status_label.set_text(
                 "Failed to capture the scene in high resolution."
             )
             return
 
+        full_res_array, depth = captured if preset.needs_depth else (captured, None)
         full_res_img = Image.fromarray(full_res_array)
-        preset = self._current_preset()
-        final = preset.apply(full_res_img)
+        final = preset.apply(full_res_img, depth)
         final.save(filename)
 
         self.status_label.set_text(
@@ -1609,6 +1929,6 @@ class PreviewWindow(Gtk.Window):
 
 
 # ---- USO ----
-def open_preview(image_array, glwidget):
-    win = PreviewWindow(image_array, glwidget)
+def open_preview(image_array, glwidget, depth=None):
+    win = PreviewWindow(image_array, glwidget, depth=depth)
     win.show_all()

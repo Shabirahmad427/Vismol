@@ -100,16 +100,7 @@ fragment_shader_surface = """
 #version 330
 precision highp float; 
 precision highp int;
-struct Light {
-   vec3 position;
-   //vec3 color;
-   vec3 intensity;
-   //vec3 specular_color;
-   float ambient_coef;
-   float shininess;
-};
-
-uniform Light my_light;
+#include <vm_lighting>
 uniform float surf_alpha;
 
 uniform vec4 fog_color;
@@ -125,23 +116,7 @@ out vec4 final_color;
 
 void main(){
     vec3 normal = normalize(frag_norm);
-    vec3 vert_to_light = normalize(my_light.position);
-    vec3 vert_to_cam = normalize(frag_coord);
-    
-    // Ambient Component
-    vec3 ambient = my_light.ambient_coef * frag_color * my_light.intensity;
-    
-    // Diffuse component
-    float diffuse_coef = (max(0.0, dot(normal, vert_to_light)) + 1.0) * 0.5;
-    vec3 diffuse = diffuse_coef * frag_color * my_light.intensity;
-    
-    // Specular component
-    float specular_coef = 0.0;
-    if (diffuse_coef > 0.0)
-        specular_coef = pow(max(0.0, dot(vert_to_cam, reflect(vert_to_light, normal))), my_light.shininess);
-    vec3 specular = specular_coef * my_light.intensity;
-    specular = specular * (vec3(1) - diffuse);
-    vec4 my_color = vec4(ambient + diffuse + specular, surf_alpha);
+    vec4 my_color = vec4(vm_lighting(normal, normalize(frag_coord), frag_color, 1.0), surf_alpha);
     
     float dist = abs(frag_coord.z);
     if(dist>=fog_start){

@@ -35,6 +35,7 @@ from vismol.libgl.vismol_font import DEFAULT_FONT_FILE, DEFAULT_FONT_SIZE
 from vismol.libgl.selection_box import SelectionBox
 import vismol.libgl.shapes as shapes
 import vismol.libgl.shaders.pick as shaders_pick
+import vismol.libgl.shaders.lighting as shaders_lighting
 import vismol.libgl.shaders.dots as shaders_dots
 import vismol.libgl.shaders.lines as shaders_lines
 import vismol.libgl.shaders.wires as shaders_wires
@@ -122,6 +123,17 @@ class VismolGLCore:
         self._fps_frame_count = 0        # frames desde o ultimo report
         self._fps_accum_time = 0.0       # tempo acumulado (s) desde o report
         self._fps_last_t = None          # timestamp do frame anterior
+        # [EN] 2026-10-13 multisample antialiasing: Gtk.GLArea gives us a
+        # single-sample framebuffer (GL_SAMPLES == 0) and has no API to ask
+        # for more, so the scene is drawn into our own multisampled
+        # framebuffer and resolved into the widget's one at the end of
+        # render() -- see _msaa_begin()/_msaa_end().
+        self._msaa_fbo = None
+        self._msaa_color_rbo = None
+        self._msaa_depth_rbo = None
+        self._msaa_state = None          # (width, height, samples) of the storage
+        self._msaa_target = None         # (framebuffer, width, height) being resolved into
+        self._msaa_failed = False        # a driver refused it: do not retry every frame
         # -------------------------------------------------------------------
         
         
@@ -213,10 +225,7 @@ class VismolGLCore:
         self.scroll_step_fraction = self.vm_config.gl_parameters.get("scroll_step_fraction", 0.138)
         self.bckgrnd_color = self.vm_config.gl_parameters["background_color"]
         #                       Light Parameters                                
-        self.light_position = self.vm_config.gl_parameters["light_position"]
-        self.light_ambient_coef = self.vm_config.gl_parameters["light_ambient_coef"]
-        self.light_shininess = self.vm_config.gl_parameters["light_shininess"]
-        self.light_intensity = self.vm_config.gl_parameters["light_intensity"]
+        self.apply_light_parameters()
         #                              Variables                                
         self.right = self.width / self.height
         self.left = -self.right
@@ -1591,6 +1600,9 @@ class VismolGLCore:
 
         #print('self.dragging', self.dragging)
         
+        # from here on only the visible scene is drawn (every picking pass
+        # above read its ID colours back from the single-sample framebuffer)
+        self._msaa_begin()
         GL.glClearColor(self.bckgrnd_color[0], self.bckgrnd_color[1],
                         self.bckgrnd_color[2], self.bckgrnd_color[3])
         GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
@@ -1702,6 +1714,9 @@ class VismolGLCore:
         # depth testing against the actual scene geometry (GL_DEPTH_TEST
         # stays enabled inside draw_hover_highlight() itself), it's just
         # not competing with any OTHER overlay for draw order here.
+        # [EN] 2026-10-17: atoms deleted/renumbered since they were stored
+        # (Delete by molecule, Undo...) must not reach the highlights below.
+        click_mode.drop_stale_builder_atoms(self)
         hovered_atom = getattr(self, "builder_hover_atom", None)
         if hovered_atom is not None:
             world_center, hover_up, hover_radius = click_mode.draw_hover_highlight(self, hovered_atom)
@@ -1839,6 +1854,7 @@ class VismolGLCore:
             if entries:
                 self._draw_text_labels(self.vm_font_index, entries, char_spacing=0.65)
 
+        self._msaa_end()
         # Fecha o cronometro do frame e reporta periodicamente. Medimos so o
         # tempo de CPU/submissao (sem glFinish, que serializaria a GPU e
         # distorceria o numero). 'ms/frame' aqui = custo da thread Python por
@@ -1860,7 +1876,145 @@ class VismolGLCore:
                 self._fps_accum_time = 0.0
         return True
     
-    def render_to_image(self, scale_factor=1):
+    def antialias_samples(self):
+        """ Number of samples per pixel asked for by the preferences
+            (gl_parameters "antialias" on/off and "antialias_samples"),
+            0 when antialiasing is off. """
+        gl_parameters = self.vm_config.gl_parameters
+        if not gl_parameters.get("antialias", True) or self._msaa_failed:
+            return 0
+        try:
+            samples = int(gl_parameters.get("antialias_samples", 4))
+        except (TypeError, ValueError):
+            samples = 4
+        return samples if samples > 1 else 0
+    
+    def _msaa_begin(self):
+        """ Redirects the drawing that follows to a multisampled
+            framebuffer of the size of the current viewport; _msaa_end()
+            resolves it into the framebuffer that was bound here (the
+            Gtk.GLArea's, the macOS offscreen one, or render_to_image()'s).
+            Does nothing when antialiasing is off or not available. """
+        self._msaa_target = None
+        samples = self.antialias_samples()
+        if samples == 0:
+            return
+        try:
+            target = int(GL.glGetIntegerv(GL.GL_FRAMEBUFFER_BINDING))
+            if self._msaa_fbo is not None and target == int(self._msaa_fbo):
+                # a previous render() raised before _msaa_end()
+                return
+            viewport = GL.glGetIntegerv(GL.GL_VIEWPORT)
+            width, height = int(viewport[2]), int(viewport[3])
+            if width <= 0 or height <= 0:
+                return
+            samples = min(samples, int(GL.glGetIntegerv(GL.GL_MAX_SAMPLES)))
+            if samples < 2:
+                return
+            if self._msaa_fbo is None:
+                self._msaa_fbo = GL.glGenFramebuffers(1)
+                self._msaa_color_rbo = GL.glGenRenderbuffers(1)
+                self._msaa_depth_rbo = GL.glGenRenderbuffers(1)
+            GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._msaa_fbo)
+            if self._msaa_state != (width, height, samples):
+                self._msaa_state = None
+                GL.glBindRenderbuffer(GL.GL_RENDERBUFFER, self._msaa_color_rbo)
+                GL.glRenderbufferStorageMultisample(GL.GL_RENDERBUFFER, samples, GL.GL_RGBA8,
+                                                    width, height)
+                GL.glBindRenderbuffer(GL.GL_RENDERBUFFER, self._msaa_depth_rbo)
+                GL.glRenderbufferStorageMultisample(GL.GL_RENDERBUFFER, samples,
+                                                    GL.GL_DEPTH_COMPONENT24, width, height)
+                GL.glBindRenderbuffer(GL.GL_RENDERBUFFER, 0)
+                GL.glFramebufferRenderbuffer(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0,
+                                             GL.GL_RENDERBUFFER, self._msaa_color_rbo)
+                GL.glFramebufferRenderbuffer(GL.GL_FRAMEBUFFER, GL.GL_DEPTH_ATTACHMENT,
+                                             GL.GL_RENDERBUFFER, self._msaa_depth_rbo)
+                status = GL.glCheckFramebufferStatus(GL.GL_FRAMEBUFFER)
+                if status != GL.GL_FRAMEBUFFER_COMPLETE:
+                    raise RuntimeError("multisampled framebuffer incomplete (status 0x{:x})".format(int(status)))
+                self._msaa_state = (width, height, samples)
+            GL.glEnable(GL.GL_MULTISAMPLE)
+            self._msaa_target = (target, width, height)
+        except Exception as error:
+            # never lose the frame because of the antialiasing: fall back
+            # to drawing straight into the widget's framebuffer, for good
+            logger.warning("antialiasing disabled, multisampled framebuffer not available: {}".format(error))
+            self._msaa_failed = True
+            self._msaa_target = None
+            try:
+                GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, target)
+            except Exception:
+                pass
+    
+    def _msaa_end(self):
+        """ Resolves the multisampled framebuffer into the one render()
+            was called with, and leaves that one bound. """
+        if self._msaa_target is None:
+            return
+        target, width, height = self._msaa_target
+        self._msaa_target = None
+        GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self._msaa_fbo)
+        GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, target)
+        GL.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height,
+                             GL.GL_COLOR_BUFFER_BIT, GL.GL_NEAREST)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, target)
+
+    
+    # Representations left out of the depth map used for exported outlines
+    # (see render_to_image(return_depth=True)): thin/flat overlays that
+    # should not get a contour of their own.
+    _NO_OUTLINE_REPRESENTATIONS = {"LinesRepresentation", "NonBondedRepresentation",
+                                   "DotsRepresentation", "OneColorDotsRepresentation",
+                                   "PickingDotsRepresentation", "DashedLinesRepresentation",
+                                   "CellLineRepresentation", "LabelRepresentation",
+                                   "WiresRepresentation"}
+
+    def _read_solid_depth(self, width, height):
+        """ Draws only the solid representations (spheres, sticks, cartoon,
+            surfaces...) into the currently bound framebuffer and returns
+            their depth as a (height, width) float32 array of distances from
+            the camera in Angstrom, top row first, np.inf on the background.
+            Also returns the size of one pixel, in Angstrom per unit of
+            distance, and the surface normals as a (height, width, 3) uint8
+            array (128 + 127 * n; the shaders' own smooth normals, so the
+            facets of the stick/sphere meshes do not show up as creases).
+        """
+        # the shared lighting block writes normals instead of colours in
+        # this mode; fog off so they are not blended with the background
+        shading_mode, fog_enabled = self.shading_mode, self.glcamera.fog_enabled
+        self.shading_mode = shaders_lighting.NORMAL_MAP_MODE
+        self.glcamera.fog_enabled = False
+        try:
+            GL.glClearColor(0.5, 0.5, 0.5, 0.0)
+            GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
+            self.update_camera_ubo()
+            for vm_object in self.vm_session.vm_objects_dic.values():
+                if vm_object.active and vm_object.frames.shape[0] > 0:
+                    for representation in vm_object.representations.values():
+                        if (representation is not None and representation.active
+                                and type(representation).__name__ not in self._NO_OUTLINE_REPRESENTATIONS):
+                            representation.draw_representation()
+            GL.glFinish()
+        finally:
+            self.shading_mode = shading_mode
+            self.glcamera.fog_enabled = fog_enabled
+        GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 1)
+        data = GL.glReadPixels(0, 0, width, height, GL.GL_RGB, GL.GL_UNSIGNED_BYTE)
+        normals = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+        normals = np.ascontiguousarray(np.flip(normals, axis=0))
+        data = GL.glReadPixels(0, 0, width, height, GL.GL_DEPTH_COMPONENT, GL.GL_FLOAT)
+        window_z = np.frombuffer(data, dtype=np.float32).reshape((height, width))
+        window_z = np.flip(window_z, axis=0)
+        # invert the projection (see mop.my_glPerspectivef): z_ndc = -A - B/z_eye;
+        # abs() because only the distance matters here
+        proj = self.glcamera.projection_matrix
+        with np.errstate(divide="ignore"):
+            distance = proj[3, 2] / (2.0 * window_z - 1.0 + proj[2, 2])
+        distance = np.where(window_z >= 1.0, np.inf, np.abs(distance)).astype(np.float32)
+        pixel_size = 2.0 / (float(proj[1, 1]) * height)
+        return distance, pixel_size, normals
+
+    def render_to_image(self, scale_factor=1, return_depth=False):
         """ Renders the current scene into an offscreen framebuffer at
             scale_factor times the widget's current resolution, then
             reads it back as a numpy RGBA array (height, width, 4) with
@@ -1889,12 +2043,20 @@ class VismolGLCore:
             scale_factor -- integer or float multiplier applied to both
                             width and height (e.g. 2 for 2x, 3 for 3x).
 
+            return_depth -- also return the depth of the solid
+                            representations, for outlines drawn from the
+                            real geometry (see _read_solid_depth() and
+                            vismol_gtkwidget.apply_contour_filter()).
+
             Returns:
             image -- np.uint8 array of shape (height*scale_factor,
                      width*scale_factor, 4), or None if the offscreen
                      framebuffer could not be created/completed.
+            With return_depth: (image, depth) where depth is a dict with
+            "distance", "pixel_size", "normals", "scale_factor" and
+            "background" (its rgb colour); None on failure.
         """
-        if scale_factor == 1:
+        if scale_factor == 1 and not return_depth:
             # No offscreen framebuffer needed - just read whatever is
             # already in the on-screen framebuffer (caller is expected
             # to have rendered a fresh frame into it already).
@@ -1983,6 +2145,11 @@ class VismolGLCore:
             data = GL.glReadPixels(0, 0, new_width, new_height, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE)
             image = np.frombuffer(data, dtype=np.uint8).reshape((new_height, new_width, 4))
             image = np.ascontiguousarray(np.flip(image, axis=0))
+            if return_depth:
+                distance, pixel_size, normals = self._read_solid_depth(new_width, new_height)
+                return image, {"distance": distance, "pixel_size": pixel_size,
+                               "normals": normals, "scale_factor": scale_factor,
+                               "background": [float(c) for c in self.bckgrnd_color[:3]]}
             return image
 
         finally:
@@ -2184,6 +2351,9 @@ class VismolGLCore:
             A shader object identifier or pops out an error
         """
         shader = GL.glCreateShader(shader_type)
+        # lit fragment shaders pull in the shared lighting block
+        # (shaders/lighting.py); a no-op for every other shader
+        shader_prog = shaders_lighting.inject(shader_prog)
         GL.glShaderSource(shader, shader_prog)
         GL.glCompileShader(shader)
         if GL.glGetShaderiv(shader, GL.GL_COMPILE_STATUS) != GL.GL_TRUE:
@@ -2735,28 +2905,81 @@ class VismolGLCore:
         uni_dot_size = self._get_uniform_location(program, "vert_dot_factor")
         GL.glUniform1fv(uni_dot_size, 1, dot_factor)
     
+    def apply_light_parameters(self):
+        """ (Re)reads every light/shading setting from gl_parameters. Call
+            it again after changing them (Preferences) and redraw: the
+            uniform cache in load_lights() picks up whatever changed.
+
+            The key light is gl_parameters "light_position"/"light_intensity";
+            "light_preset" may move it and adds the fill/rim lights (see
+            shaders/lighting.py), and "extra_lights" appends user-defined
+            ones ({"direction": [x, y, z], "intensity": [r, g, b]}), up to
+            MAX_LIGHTS in total. Directions are fixed relative to the camera.
+        """
+        params = self.vm_config.gl_parameters
+        self.light_position = params["light_position"]
+        self.light_ambient_coef = params["light_ambient_coef"]
+        self.light_shininess = params["light_shininess"]
+        self.light_intensity = params["light_intensity"]
+        preset = params.get("light_preset", "headlight")
+        if preset not in shaders_lighting.LIGHT_PRESETS:
+            preset = "headlight"
+        key_dir = shaders_lighting.PRESET_KEY_DIRECTION.get(preset, self.light_position)
+        lights = [{"direction": key_dir, "intensity": self.light_intensity}]
+        lights += shaders_lighting.LIGHT_PRESETS[preset]
+        lights += list(params.get("extra_lights", []))
+        lights = lights[:shaders_lighting.MAX_LIGHTS]
+        dirs = np.zeros((shaders_lighting.MAX_LIGHTS, 3), dtype=np.float32)
+        ints = np.zeros((shaders_lighting.MAX_LIGHTS, 3), dtype=np.float32)
+        for i, light in enumerate(lights):
+            direction = np.array(light["direction"], dtype=np.float32)
+            norm = np.linalg.norm(direction)
+            dirs[i] = direction / norm if norm > 0 else (0.0, 0.0, 1.0)
+            ints[i] = light["intensity"]
+        self.n_lights = len(lights)
+        self.light_directions = dirs
+        self.light_intensities = ints
+        self.light_ambient = (np.float32(self.light_ambient_coef)
+                              * np.array(self.light_intensity, dtype=np.float32))
+        mode = params.get("shading_mode", "standard")
+        self.shading_mode = shaders_lighting.SHADING_MODE_IDS.get(mode, 0)
+        self.flat_softness = float(params.get("flat_softness", 0.25))
+        self.toon_bands = max(1.0, float(params.get("toon_bands", 3)))
+
     def load_lights(self, program):
-        """ Function doc
+        """ Uploads the shared lighting uniforms (shaders/lighting.py).
 
             Cache de uniforms: a posicao/intensidade da luz e constante entre
             objetos e quase sempre entre frames, entao so reenviamos no diff.
         """
-        val = self._hashable(self.light_position)
-        loc, changed = self._uniform_changed(program, "my_light.position", val)
+        loc, changed = self._uniform_changed(program, "vm_n_lights", self.n_lights)
         if changed:
-            GL.glUniform3fv(loc, 1, self.light_position)
-        val = self._hashable(self.light_ambient_coef)
-        loc, changed = self._uniform_changed(program, "my_light.ambient_coef", val)
+            GL.glUniform1i(loc, self.n_lights)
+        val = self._hashable(self.light_directions)
+        loc, changed = self._uniform_changed(program, "vm_light_dir", val)
         if changed:
-            GL.glUniform1fv(loc, 1, self.light_ambient_coef)
+            GL.glUniform3fv(loc, shaders_lighting.MAX_LIGHTS, self.light_directions)
+        val = self._hashable(self.light_intensities)
+        loc, changed = self._uniform_changed(program, "vm_light_int", val)
+        if changed:
+            GL.glUniform3fv(loc, shaders_lighting.MAX_LIGHTS, self.light_intensities)
+        val = self._hashable(self.light_ambient)
+        loc, changed = self._uniform_changed(program, "vm_ambient", val)
+        if changed:
+            GL.glUniform3fv(loc, 1, self.light_ambient)
         val = self._hashable(self.light_shininess)
-        loc, changed = self._uniform_changed(program, "my_light.shininess", val)
+        loc, changed = self._uniform_changed(program, "vm_shininess", val)
         if changed:
-            GL.glUniform1fv(loc, 1, self.light_shininess)
-        val = self._hashable(self.light_intensity)
-        loc, changed = self._uniform_changed(program, "my_light.intensity", val)
+            GL.glUniform1f(loc, self.light_shininess)
+        loc, changed = self._uniform_changed(program, "vm_shading_mode", self.shading_mode)
         if changed:
-            GL.glUniform3fv(loc, 1, self.light_intensity)
+            GL.glUniform1i(loc, self.shading_mode)
+        loc, changed = self._uniform_changed(program, "vm_flat_softness", self.flat_softness)
+        if changed:
+            GL.glUniform1f(loc, self.flat_softness)
+        loc, changed = self._uniform_changed(program, "vm_toon_bands", self.toon_bands)
+        if changed:
+            GL.glUniform1f(loc, self.toon_bands)
     
     def load_antialias_params(self, program):
         """ Function doc
@@ -3043,6 +3266,10 @@ class VismolGLCore:
         self.shader_programs["lines_sel"] = self.load_shaders(shaders_lines.shader_type[line_type]["sel_vertex_shader"],
                                                       shaders_lines.shader_type[line_type]["sel_fragment_shader"],
                                                       shaders_lines.shader_type[line_type]["sel_geometry_shader"])
+        # second pass of LinesRepresentation: double/triple bonds (GL_LINES_ADJACENCY)
+        self.shader_programs["lines_multi"] = self.load_shaders(shaders_lines.vertex_shader_lines_multi,
+                                                                shaders_lines.fragment_shader_lines,
+                                                                shaders_lines.geometry_shader_lines_multi)
         '''
         #sticks_type = self.vm_config.gl_parameters["sticks_type"]
         #self.shader_programs["lines"] = self.load_shaders(shaders_sticks.shader_type[sticks_type]["vertex_shader"],

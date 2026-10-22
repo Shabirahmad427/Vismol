@@ -7,8 +7,8 @@
 #  ribbon_backbone.py in vismol/utils/ and CartoonRepresentation in
 #  libgl/representations.py) -- replaces the shader that shipped with the
 #  cartoon implementation being removed. `CameraMatrices` (the UBO block:
-#  view_mat/proj_mat), the `model_mat` uniform, and the `Light my_light`
-#  uniform struct (position/intensity/ambient_coef/shininess) are NOT a
+#  view_mat/proj_mat), the `model_mat` uniform, and the shared lighting
+#  block (shaders/lighting.py, `#include <vm_lighting>`) are NOT a
 #  cartoon-specific convention to reinvent -- they're this whole engine's
 #  own fixed per-frame binding contract (VismolGLCore.update_camera_ubo()/
 #  load_lights(), shared by every representation type's shader), so this
@@ -39,10 +39,10 @@ void main () {
     frag_color = vert_color;
     // [EN] Matches every other shader in this package's own convention
     // (see e.g. shaders/sticks.py): normals are transformed by model_mat
-    // alone, not the full model-view matrix -- my_light.position (below)
-    // is likewise a fixed, un-transformed direction (VismolGLCore.
-    // load_lights() uploads self.light_position as-is, no per-frame view
-    // transform), so keeping normals in that SAME space is what makes
+    // alone, not the full model-view matrix -- the light directions
+    // (vm_light_dir, see shaders/lighting.py) are likewise fixed,
+    // un-transformed directions (VismolGLCore.load_lights(), no per-frame
+    // view transform), so keeping normals in that SAME space is what makes
     // the dot-product lighting math correct here, not an inconsistency.
     frag_norm = mat3(transpose(inverse(model_mat))) * vert_norm;
     frag_coord = (view_mat * model_mat * vec4(vert_coord, 1.0)).xyz;
@@ -53,14 +53,7 @@ void main () {
 f_shader_triangles = """
 #version 330
 
-struct Light {
-    vec3 position;
-    vec3 intensity;
-    float ambient_coef;
-    float shininess;
-};
-
-uniform Light my_light;
+#include <vm_lighting>
 // [EN] 2026-09-26 user request ("alterar a transparencia da representacao
 // de cartoon"): plain alpha uniform, same role as SurfaceRepresentation's
 // own "surf_alpha" -- see CartoonRepresentation.draw_representation() for
@@ -105,22 +98,7 @@ void main () {
         normal = -normal;
     }
 
-    vec3 vert_to_light = normalize(my_light.position);
-    vec3 vert_to_cam   = normalize(frag_coord);
-
-    vec3 ambient = my_light.ambient_coef * frag_color * my_light.intensity;
-
-    float diffuse_coef = max(0.0, dot(normal, vert_to_light));
-    vec3 diffuse = diffuse_coef * frag_color * my_light.intensity;
-
-    float specular_coef = 0.0;
-    if (diffuse_coef > 0.0) {
-        specular_coef = pow(max(0.0, dot(vert_to_cam, reflect(vert_to_light, normal))), my_light.shininess);
-    }
-    vec3 specular = specular_coef * my_light.intensity;
-    specular = specular * (vec3(1.0) - diffuse);
-
-    vec3 lit_color = ambient + diffuse + specular;
+    vec3 lit_color = vm_lighting(normal, normalize(frag_coord), frag_color, 0.0);
 
     // [EN] frag_coord is already in view space (see v_shader_triangles),
     // so |z| is the eye distance -- same formula as shaders/sticks.py,

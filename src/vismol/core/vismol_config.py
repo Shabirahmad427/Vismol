@@ -61,12 +61,14 @@ class VismolConfig:
                               # False = tudo como ligacao simples (cilindro unico).
                               # Pode ser alterado em runtime (ver SticksRepresentation).
                               "multiple_bonds": True,
+                              "lines_bond_spacing": 1.0,
                               # Liga/desliga a representacao pontilhada das ligacoes
                               # de coordenacao metalica (metal-ligante). True =
                               # ligacoes com metal viram linha pontilhada e saem
                               # dos sticks; False = tratadas como ligacao normal.
                               "metal_dashed_bonds": True,
                               "antialias": True,
+                              "antialias_samples": 4,
                               "mouse_rotation_sensibility" : 1.5,
 
                               "scroll_step": 0.9,
@@ -96,6 +98,20 @@ class VismolConfig:
                               "light_shininess": 5.5,
                               "light_intensity": [0.6, 0.6, 0.6],
                               "light_specular_color": [1.0, 1.0, 1.0],
+                              # Lighting / shading -- see libgl/shaders/lighting.py
+                              # and VismolGLCore.apply_light_parameters().
+                              #   light_preset -- "headlight" (the single light
+                              #       above) or "three_point" (key + fill + rim)
+                              #   extra_lights -- more lights, each
+                              #       {"direction": [x,y,z], "intensity": [r,g,b]},
+                              #       fixed relative to the camera (max 4 in total)
+                              #   shading_mode -- "standard", "flat", "toon", "matte",
+                              #       "glossy" or "rim"
+                              "light_preset": "headlight",
+                              "extra_lights": [],
+                              "shading_mode": "standard",
+                              "flat_softness": 0.25,
+                              "toon_bands": 3,
                               "center_on_coord_sleep_time": 0.01,
                               "gridsize": 0.8,
                               "maxbond": 2.4,
