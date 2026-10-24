@@ -1511,7 +1511,7 @@ class PreviewWindow(Gtk.Window):
     """
 
     def __init__(self, image_array, glwidget, depth=None):
-        super().__init__(title="Preview / Export")
+        super().__init__(title="Export Image")
         self.glwidget = glwidget
         # depth map matching image_array, for the "contour" style
         self.preview_depth = depth
@@ -1629,10 +1629,10 @@ class PreviewWindow(Gtk.Window):
         controls.pack_start(self.preset_combo, False, False, 0)
 
         preset_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        load_btn = Gtk.Button(label="load")
+        load_btn = Gtk.Button(label="Load...")
         load_btn.connect("clicked", self.on_load_preset)
         preset_btn_box.pack_start(load_btn, True, True, 0)
-        save_btn = Gtk.Button(label="Save as...")
+        save_btn = Gtk.Button(label="Save As...")
         save_btn.connect("clicked", self.on_save_preset)
         preset_btn_box.pack_start(save_btn, True, True, 0)
         controls.pack_start(preset_btn_box, False, False, 0)

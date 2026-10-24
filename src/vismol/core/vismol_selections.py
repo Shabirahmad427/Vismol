@@ -560,6 +560,8 @@ class VismolPickingSelection:
             self.vm_session.vm_geometric_object_dic[vobj_label].representations["picking_spheres"].was_rep_ind_modified = True
             self.vm_session.vm_geometric_object_dic[vobj_label].representations["picking_spheres"].active = True
 
+        self.update_angle_arcs()
+
     def generate_pki_pkj_representations(self, vobj_label="pk1pk2", atom1=None, atom2=None):
         """ Function doc """
         xyz1 = atom1.coords()
@@ -724,6 +726,99 @@ class VismolPickingSelection:
 
         else:
             pass
+
+        self.update_angle_arcs()
+
+    # ------------------------------------------------------------------
+    # 2026-10-24: angle (#1-#2-#3) and dihedral (#1-#2-#3-#4) of the picked
+    # atoms, drawn as dashed arcs with their values (like the distances).
+    # The arcs are geometric objects "pk_angle" / "pk_dihedral"; their
+    # label_text / label_pos are read by VismolGLCore._draw_arc_labels().
+    # ------------------------------------------------------------------
+    ARC_POINTS = 17
+
+    ARC_COLORS = {"pk_angle": (1.0, 0.62, 0.15), "pk_dihedral": (0.35, 0.80, 1.0)}
+
+    def _set_arc_object(self, label, points, text = None, text_pos = None):
+        dic = self.vm_session.vm_geometric_object_dic
+        obj = dic.get(label)
+        if points is None:
+            if obj is not None:
+                obj.representations["dash"].active = False
+                obj.label_text = None
+            return
+        frame = np.asarray(points, dtype = np.float32)
+        n = len(frame)
+        if obj is None or len(obj.atoms) != n:
+            obj = VismolObject(name = "UNK", index = -1, vismol_session = self.vm_session,
+                               trajectory = [frame], bonds_pair_of_indexes = [0, 1])
+            obj.set_model_matrix(self.vm_session.vm_glcore.model_mat)
+            for i in range(n):
+                atom = Atom(vismol_object = obj, name = 'pK', index = i, residue = None, chain = None,
+                            atom_id = i, occupancy = 0, bfactor = 0, charge = 0)
+                atom.color = np.array(self.ARC_COLORS.get(label, (1, 1, 1)), dtype = np.float32)
+                obj.atoms[i] = atom
+            obj._generate_color_vectors(-1)
+            obj.active = True
+            obj.index_bonds = [k for i in range(n - 1) for k in (i, i + 1)]
+            obj.create_representation(rep_type = "dash")
+            color = self.ARC_COLORS.get(label, (1, 1, 1))
+            obj.representations["dash"].color2 = [color[0], color[1], color[2]]
+            dic[label] = obj
+        else:
+            obj.frames = frame.reshape(1, n, 3)
+            obj.representations["dash"].was_rep_coord_modified = True
+        obj.representations["dash"].active = True
+        obj.label_text = text
+        obj.label_pos  = text_pos
+
+    def update_angle_arcs (self):
+        """ Arcs and values of the angle #1-#2-#3 (at #2) and of the dihedral
+            #1-#2-#3-#4 (around the #2-#3 bond). With four atoms picked only the
+            dihedral is shown (2026-10-24); the angle with three. """
+        a1, a2, a3, a4 = self.picking_selections_list[:4]
+        angle_points = dihedral_points = None
+        angle_text = angle_pos = dihedral_text = dihedral_pos = None
+        if a1 and a2 and a3 and not a4:
+            p1, p2, p3 = (np.asarray(a.coords(), dtype = float) for a in (a1, a2, a3))
+            u, w = p1 - p2, p3 - p2
+            nu, nw = np.linalg.norm(u), np.linalg.norm(w)
+            if nu > 1e-6 and nw > 1e-6:
+                u, w = u / nu, w / nw
+                theta = float(np.arccos(np.clip(np.dot(u, w), -1.0, 1.0)))
+                # . in-plane unit vector perpendicular to u, towards w
+                v = w - np.dot(w, u) * u
+                nv = np.linalg.norm(v)
+                if nv > 1e-6:
+                    v = v / nv
+                    r = float(np.clip(0.65 * min(nu, nw), 0.9, 1.2))
+                    ts = np.linspace(0.0, theta, self.ARC_POINTS)
+                    angle_points = [p2 + r * (np.cos(t) * u + np.sin(t) * v) for t in ts]
+                    mid = theta / 2.0
+                    angle_pos  = p2 + 1.55 * r * (np.cos(mid) * u + np.sin(mid) * v)
+                    angle_text = '{:.1f}'.format(np.degrees(theta))
+        if a1 and a2 and a3 and a4:
+            p1, p2, p3, p4 = (np.asarray(a.coords(), dtype = float) for a in (a1, a2, a3, a4))
+            b = p3 - p2
+            nb = np.linalg.norm(b)
+            if nb > 1e-6:
+                b = b / nb
+                e1 = (p1 - p2) - np.dot(p1 - p2, b) * b
+                e4 = (p4 - p3) - np.dot(p4 - p3, b) * b
+                n1, n4 = np.linalg.norm(e1), np.linalg.norm(e4)
+                if n1 > 1e-6 and n4 > 1e-6:
+                    e1, e4 = e1 / n1, e4 / n4
+                    e2 = np.cross(b, e1)
+                    phi = float(np.arctan2(np.dot(e4, e2), np.dot(e4, e1)))
+                    m = 0.5 * (p2 + p3)
+                    r = float(np.clip(0.6 * nb, 0.7, 1.1))
+                    ts = np.linspace(0.0, phi, self.ARC_POINTS)
+                    dihedral_points = [m + r * (np.cos(t) * e1 + np.sin(t) * e2) for t in ts]
+                    mid = phi / 2.0
+                    dihedral_pos  = m + 1.35 * r * (np.cos(mid) * e1 + np.sin(mid) * e2)
+                    dihedral_text = '{:.1f}'.format(np.degrees(phi))
+        self._set_arc_object("pk_angle", angle_points, angle_text, angle_pos)
+        self._set_arc_object("pk_dihedral", dihedral_points, dihedral_text, dihedral_pos)
 
     def get_angle_pk1_pk2_pk3 (self):
         """ Function doc """

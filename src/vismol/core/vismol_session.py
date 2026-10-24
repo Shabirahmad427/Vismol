@@ -90,7 +90,8 @@ class VismolSession(Config):
         see vismol_glcore.py  ->  render function
         '''
         self.vm_geometric_object_dic = {"pk1pk2":None, "pk2pk3":None, "pk3pk4":None,
-                                        "pk1": None  , "pk2": None  , "pk3": None  , "pk4": None}
+                                        "pk1": None  , "pk2": None  , "pk3": None  , "pk4": None,
+                                        "pk_angle": None, "pk_dihedral": None}
         
         if toolkit == "Gtk_3.0":
             from vismol.gui.vismol_gtkwidget import VismolGTKWidget

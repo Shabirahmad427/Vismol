@@ -1634,8 +1634,8 @@ class VismolGLCore:
             '''
             #'''
             '''Two loops are necessary so that the labels are always drawn above the dash lines.'''
-            for geo_object in ["pk1pk2", "pk2pk3", "pk3pk4"]:
-                if self.vm_session.vm_geometric_object_dic[geo_object]:
+            for geo_object in ["pk1pk2", "pk2pk3", "pk3pk4", "pk_angle", "pk_dihedral"]:
+                if self.vm_session.vm_geometric_object_dic.get(geo_object):
                     if self.vm_session.vm_geometric_object_dic[geo_object].representations["dash"].active:
                         self.vm_session.vm_geometric_object_dic[geo_object].representations["dash"].draw_representation()
             
@@ -1644,6 +1644,10 @@ class VismolGLCore:
                 if self.vm_session.vm_geometric_object_dic[geo_object]:
                     if self.vm_session.vm_geometric_object_dic[geo_object].representations["dash"].active:
                         self._draw_distance_labels(self.vm_session.vm_geometric_object_dic[geo_object])
+            for geo_object in ["pk_angle", "pk_dihedral"]:
+                arc = self.vm_session.vm_geometric_object_dic.get(geo_object)
+                if arc and arc.representations["dash"].active:
+                    self._draw_arc_labels(arc)
             
             '''                               drawing picking spheres                     '''
             for geo_object in ["pk1", "pk2", "pk3", "pk4"]:
@@ -3157,6 +3161,17 @@ class VismolGLCore:
         # by the shader so it no longer skews with camera rotation.
         self._draw_text_labels(self.vm_font_dist, [(text, midpoint, -len(text) / 2.0)])
     
+    def _draw_arc_labels(self, vm_object):
+        """ The value of an angle or dihedral arc of the picked atoms (degrees). """
+        text = getattr(vm_object, "label_text", None)
+        pos  = getattr(vm_object, "label_pos", None)
+        if not text or pos is None:
+            return
+        if self.vm_font_dist.vao is None:
+            self.vm_font_dist.color = np.array(self.vm_session.vm_config.gl_parameters["pk_dist_label_color"], dtype=np.float32)
+        self.vm_font_dist.char_res = 15
+        self._draw_text_labels(self.vm_font_dist, [(text, (pos[0], pos[1], pos[2]), -len(text) / 2.0)])
+
     def _draw_picking_label(self):
         """ This function draws the labels of the atoms selected by the
             function picking #1 #2 #3 #4
