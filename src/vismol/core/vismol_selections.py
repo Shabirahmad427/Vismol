@@ -737,7 +737,21 @@ class VismolPickingSelection:
     # ------------------------------------------------------------------
     ARC_POINTS = 17
 
+    # 2026-10-29: defaults used when running vismol standalone (no EasyHybrid
+    # Preferences around) or when an older gl_parameters dict lacks these
+    # keys -- Preferences > Selections > Picking Selections now owns the
+    # on/off switch and the colors (gl_parameters "show_pk_angle_dihedral_arcs",
+    # "pk_angle_arc_color", "pk_dihedral_arc_color").
     ARC_COLORS = {"pk_angle": (1.0, 0.62, 0.15), "pk_dihedral": (0.35, 0.80, 1.0)}
+
+    def _gl_parameters(self):
+        vm_config = getattr(self.vm_session, "vm_config", None)
+        return vm_config.gl_parameters if vm_config is not None else {}
+
+    def _arc_color(self, label):
+        key = "pk_angle_arc_color" if label == "pk_angle" else "pk_dihedral_arc_color"
+        color = self._gl_parameters().get(key, self.ARC_COLORS.get(label, (1, 1, 1)))
+        return color[:3]
 
     def _set_arc_object(self, label, points, text = None, text_pos = None):
         dic = self.vm_session.vm_geometric_object_dic
@@ -747,6 +761,7 @@ class VismolPickingSelection:
                 obj.representations["dash"].active = False
                 obj.label_text = None
             return
+        color = self._arc_color(label)
         frame = np.asarray(points, dtype = np.float32)
         n = len(frame)
         if obj is None or len(obj.atoms) != n:
@@ -756,18 +771,19 @@ class VismolPickingSelection:
             for i in range(n):
                 atom = Atom(vismol_object = obj, name = 'pK', index = i, residue = None, chain = None,
                             atom_id = i, occupancy = 0, bfactor = 0, charge = 0)
-                atom.color = np.array(self.ARC_COLORS.get(label, (1, 1, 1)), dtype = np.float32)
+                atom.color = np.array(color, dtype = np.float32)
                 obj.atoms[i] = atom
             obj._generate_color_vectors(-1)
             obj.active = True
             obj.index_bonds = [k for i in range(n - 1) for k in (i, i + 1)]
             obj.create_representation(rep_type = "dash")
-            color = self.ARC_COLORS.get(label, (1, 1, 1))
-            obj.representations["dash"].color2 = [color[0], color[1], color[2]]
             dic[label] = obj
         else:
             obj.frames = frame.reshape(1, n, 3)
             obj.representations["dash"].was_rep_coord_modified = True
+        # Re-applied every call (not just on creation) so a color changed in
+        # Preferences shows up on the next arc update, not only on a new pick.
+        obj.representations["dash"].color2 = [color[0], color[1], color[2]]
         obj.representations["dash"].active = True
         obj.label_text = text
         obj.label_pos  = text_pos
@@ -775,7 +791,14 @@ class VismolPickingSelection:
     def update_angle_arcs (self):
         """ Arcs and values of the angle #1-#2-#3 (at #2) and of the dihedral
             #1-#2-#3-#4 (around the #2-#3 bond). With four atoms picked only the
-            dihedral is shown (2026-10-24); the angle with three. """
+            dihedral is shown (2026-10-24); the angle with three.
+
+            2026-10-29: Preferences > Selections > Picking Selections can turn
+            this whole representation off ("show_pk_angle_dihedral_arcs"). """
+        if not self._gl_parameters().get('show_pk_angle_dihedral_arcs', True):
+            self._set_arc_object("pk_angle", None)
+            self._set_arc_object("pk_dihedral", None)
+            return
         a1, a2, a3, a4 = self.picking_selections_list[:4]
         angle_points = dihedral_points = None
         angle_text = angle_pos = dihedral_text = dihedral_pos = None
