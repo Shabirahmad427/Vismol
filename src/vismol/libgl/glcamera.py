@@ -318,14 +318,30 @@ class GLCamera():
         """ Reads the fog_* keys of gl_parameters (Preferences > General
             > Fog) into this camera and recomputes the fog range. Missing
             keys keep the defaults, i.e. the original look. """
-        self.fog_range_scale = float(gl_parameters.get("fog_range_scale", 1.0))
+        try:
+            range_scale = float(gl_parameters.get("fog_range_scale", 1.0))
+        except (TypeError, ValueError, OverflowError):
+            range_scale = 1.0
+        # `float()` accepts strings such as "inf" and "nan". Those values
+        # propagate into fog_start and overflow when PyOpenGL converts the
+        # uniform to float32. Ignore invalid persisted preferences and cap
+        # extreme but finite values to a useful fog range.
+        if not np.isfinite(range_scale) or range_scale <= 0.0:
+            range_scale = 1.0
+        self.fog_range_scale = min(range_scale, 1000.0)
         self.fog_enabled = bool(gl_parameters.get("fog_enabled", True))
         self.fog_intensity = float(gl_parameters.get("fog_intensity", 100.0)) / 100.0
         self.fog_custom_range = bool(gl_parameters.get("fog_custom_range", False))
         self.fog_start_percent = float(gl_parameters.get("fog_start_percent", 50.0))
         self.fog_end_percent = float(gl_parameters.get("fog_end_percent", 100.0))
         self.fog_start_reference = gl_parameters.get("fog_start_reference", "far_plane")
-        self.fog_center_offset = float(gl_parameters.get("fog_center_offset", 5.0))
+        try:
+            center_offset = float(gl_parameters.get("fog_center_offset", 5.0))
+        except (TypeError, ValueError, OverflowError):
+            center_offset = 5.0
+        if not np.isfinite(center_offset):
+            center_offset = 5.0
+        self.fog_center_offset = center_offset
         self.update_fog()
     
     def print_parms(self):

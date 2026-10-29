@@ -266,6 +266,11 @@ class VismolGLCore:
             width -- Actual width of the window
             height -- Actual height of the window
         """
+        # GTK can briefly report an empty allocation while a window is
+        # being created, hidden, or resized. Do not divide by zero or replace
+        # the last valid viewport/projection with an invalid one.
+        if width <= 0 or height <= 0:
+            return
         self.width = np.float32(width)
         self.height = np.float32(height)
         self.right = self.width / self.height
@@ -281,10 +286,17 @@ class VismolGLCore:
         # builds the projection clamps it with max(z_near, min_znear) --
         # this one didn't, so a resize after widening the clipping built
         # an invalid perspective matrix (near <= 0).
+        effective_near = max(float(self.glcamera.z_near),
+                             float(self.glcamera.min_znear))
+        # A clipping-slab change can leave the stored far plane below the
+        # effective near plane. Keep the stored slab untouched, but ensure
+        # the projection matrix always receives an ordered, non-empty range.
+        effective_far = max(float(self.glcamera.z_far),
+                            effective_near + float(self.glcamera.min_zfar))
         _proj_mat = mop.my_glPerspectivef(self.glcamera.field_of_view,
                                           self.glcamera.viewport_aspect_ratio,
-                                          max(self.glcamera.z_near, self.glcamera.min_znear),
-                                          self.glcamera.z_far)
+                                          effective_near,
+                                          effective_far)
         self.glcamera.set_projection_matrix(_proj_mat)
 
     def _macos_modes_from_buttons(self, left, middle, right):
@@ -1099,10 +1111,23 @@ class VismolGLCore:
             # original 0.26 default (user's own follow-up: "podemos deixar o
             # passo mais fino, talvez metade do atual" -- 0.138 is the exact
             # rate solving exp(rate)-1 = (exp(0.26)-1)/2, not a rough guess).
-            slab_width = max ( self.glcamera.z_far - self.glcamera.z_near, 0.05 )
+            max_slab_width = 1000.0  # Angstroms; ample for molecular scenes
+            slab_width = max(float(self.glcamera.z_far - self.glcamera.z_near), 0.05)
+            if not np.isfinite(slab_width):
+                # Recover from invalid camera state left by an older build or
+                # an extreme gesture, centering a usable slab on the camera.
+                center = max(float(self.dist_cam_zrp), self.glcamera.min_zfar)
+                self.glcamera.z_near = center - max_slab_width / 2.0
+                self.glcamera.z_far = center + max_slab_width / 2.0
+                slab_width = max_slab_width
+            elif slab_width > max_slab_width:
+                center = 0.5 * (float(self.glcamera.z_near) + float(self.glcamera.z_far))
+                self.glcamera.z_near = center - max_slab_width / 2.0
+                self.glcamera.z_far = center + max_slab_width / 2.0
+                slab_width = max_slab_width
             rate = self.scroll_step_fraction
             if up:
-                new_width = slab_width * np.exp ( rate )
+                new_width = min(slab_width * np.exp(rate), max_slab_width)
                 step = ( new_width - slab_width ) / 2.0
                 self.glcamera.z_near -= step
                 self.glcamera.z_far += step

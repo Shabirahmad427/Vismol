@@ -511,15 +511,22 @@ class VismolGTKWidget(_WidgetBase):
 
         total = self._scroll_remainder - delta_y
         steps = int(total)                  # truncates toward zero
-        self._scroll_remainder = total - steps
-        if steps == 0:
+        # A fast trackpad swipe can report a large accumulated delta in a
+        # single event. Applying every step in a tight loop makes the
+        # exponentially widening clipping slab jump far beyond useful
+        # molecular viewing ranges (and can stall GTK while doing so).
+        # Bound each event and discard excess motion; later events continue
+        # to provide responsive, predictable zooming.
+        applied_steps = max(-4, min(steps, 4))
+        self._scroll_remainder = 0.0 if applied_steps != steps else total - steps
+        if applied_steps == 0:
             return
 
         saved_ctrl, saved_shift = self.vm_glcore.ctrl, self.vm_glcore.shift
         self.vm_glcore.ctrl, self.vm_glcore.shift = ctrl, shift
         try:
-            direction = 1 if steps > 0 else -1
-            for _ in range(abs(steps)):
+            direction = 1 if applied_steps > 0 else -1
+            for _ in range(abs(applied_steps)):
                 self.vm_glcore.mouse_scroll(direction)
         finally:
             self.vm_glcore.ctrl, self.vm_glcore.shift = saved_ctrl, saved_shift
